@@ -1,0 +1,9 @@
+{
+  "id": "relink-island",
+  "name": "Relink 灵动岛",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": "index.html",
+  "description": "桌面顶部的通话胶囊，随时查看频道与共享状态。",
+  "capabilities": ["voice.read", "voice.mute", "voice.deafen", "app.show", "window.resize"]
+}
