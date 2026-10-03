@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.rlplugin -text
+*.png -text
+*.webp -text
