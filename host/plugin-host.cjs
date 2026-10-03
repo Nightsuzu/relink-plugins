@@ -18,13 +18,28 @@ class PluginHost {
   async readPackage(file) {
     const stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES) throw new PluginViolation('package-file');
-    const bytes = await fs.readFile(file);
-    return verifyPackage(bytes, this.authority);
+    const handle = await fs.open(file, 'r');
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.size > MAX_BYTES) throw new PluginViolation('package-file');
+      // Read at most one byte beyond the observed size: concurrent growth cannot allocate arbitrary memory.
+      const buffer = Buffer.alloc(opened.size + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      if (length > opened.size) throw new PluginViolation('package-changed');
+      return verifyPackage(buffer.subarray(0, length), this.authority);
+    } finally { await handle.close(); }
   }
   async initialize() {
     await fs.mkdir(this.root, { recursive: true });
     try {
-      const raw = JSON.parse(await fs.readFile(path.join(this.root, 'preferences.json'), 'utf8'));
+      const preferencesFile = path.join(this.root, 'preferences.json');
+      if ((await fs.stat(preferencesFile)).size > 65536) throw new Error('Plugin preferences are too large.');
+      const raw = JSON.parse(await fs.readFile(preferencesFile, 'utf8'));
       if (raw && typeof raw === 'object' && !Array.isArray(raw)) this.preferences = raw;
     } catch (error) { if (error.code !== 'ENOENT') this.preferences = {}; }
     const builtin = path.join(__dirname, 'relink-island.rlplugin');

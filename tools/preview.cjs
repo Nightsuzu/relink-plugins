@@ -3,14 +3,18 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { inspectPackage } = require('../runtime/package.cjs');
+const { inspectPackage, MAX_BYTES } = require('../runtime/package.cjs');
 const source = path.resolve(process.argv[2] || path.join(__dirname, '../examples/island'));
 const manifest = JSON.parse(fs.readFileSync(path.join(source, 'manifest.json'), 'utf8'));
 const files = {};
-for (const file of fs.readdirSync(source)) {
+const entries = fs.readdirSync(source);
+if (entries.length > 33) throw new Error('At most 32 assets are supported.');
+let size = 0;
+for (const file of entries) {
   if (file === 'manifest.json') continue;
   const full = path.join(source, file), stat = fs.lstatSync(full);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Only flat regular assets are supported.');
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES / 2) throw new Error('Only flat regular assets up to 1 MiB are supported.');
+  size += stat.size; if (size > MAX_BYTES / 2) throw new Error('Total assets exceed 1 MiB.');
   files[file] = fs.readFileSync(full).toString('base64');
 }
 const { assets } = inspectPackage(JSON.stringify({ format: 1, manifest, files }));
