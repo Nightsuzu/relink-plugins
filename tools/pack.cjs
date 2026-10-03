@@ -2,8 +2,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { inspectPackage, MAX_BYTES } = require('../runtime/package.cjs');
-const source = path.resolve(process.argv[2] || path.join(__dirname, '../examples/island'));
-const output = path.resolve(process.argv[3] || 'island.unsigned.rlplugin');
+const source = path.resolve(process.argv[2] || path.join(__dirname, '../examples/hello-relink'));
+const output = path.resolve(process.argv[3] || 'hello-relink.unsigned.rlplugin');
 const manifest = JSON.parse(fs.readFileSync(path.join(source, 'manifest.json'), 'utf8'));
 const files = Object.create(null);
 const entries = fs.readdirSync(source);

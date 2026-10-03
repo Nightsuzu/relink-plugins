@@ -1,0 +1,9 @@
+{
+  "id": "hello-relink",
+  "name": "Relink 最小示例",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": "index.html",
+  "description": "演示状态订阅与返回主窗口的最小插件。",
+  "capabilities": ["voice.read", "app.show"]
+}
