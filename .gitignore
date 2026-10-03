@@ -4,3 +4,5 @@ node_modules/
 *.key
 .private/
 test-results/
+
+native/bin/

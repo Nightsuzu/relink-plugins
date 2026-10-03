@@ -1,6 +1,6 @@
 # Relink Plugins
 
-Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1 / SDK 0.1.0**。代码开源许可与 Relink 客户端的发布授权分别管理。
+Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1 / SDK 0.3.0**。代码开源许可与 Relink 客户端的发布授权分别管理。
 
 [官网开发文档与提交入口](https://relinkus.cn/plugins/) · [审核与发布指南](docs/publishing.md)
 
@@ -51,14 +51,23 @@ stop();
 | `voice.deafen` | 切换当前拒听状态 |
 | `app.show` | 返回 Relink 主窗口 |
 | `window.resize` | 展开或收起插件胶囊 |
+| `music.read` | 读取支持的本机播放器曲目、封面和播放状态 |
+| `music.control` | 控制所选媒体会话播放、暂停、上一首、下一首 |
+| `music.lyrics` | 宿主通过 LRCLIB 匹配同步歌词 |
+| `channels.read` | 读取当前 Room 的语音频道列表 |
+| `channels.switch` | 通过主客户端正常鉴权流程切换频道 |
 
-状态字段见 [index.d.ts](index.d.ts)。没有账户 ID、手机号、令牌、聊天记录、音频或桌面纹理。插件不会申请操作系统麦克风或录屏权限。每插件操作限制为每秒 8 次。
+状态字段见 [index.d.ts](index.d.ts)。没有账户 ID、手机号、令牌、聊天记录、音频或桌面纹理。插件不会申请操作系统麦克风或录屏权限。每插件通话操作限制为每秒 8 次；展开与收起使用独立的每秒 24 次限制，反向操作会合并待执行的画布收缩。
+
+支持呈现状态的新宿主提供可选的 `getPresentation()` 与 `onPresentation(callback)`，需要 `window.resize` 权限，返回 `{ gameMode: boolean, topInset: number }`，不包含游戏名、进程或窗口内容。`topInset` 是常规模式中可见胶囊距离屏幕顶部的安全间距（18–128 DIP）。调用 `getPresentation()` 表示插件能够响应呈现模式：常规画布为 320×(topInset+70)，展开为 400×(topInset+242)；游戏时收起为 204×38，顶部贴屏，实际可见区域建议为 188×28。常规可见区域建议为 304×58，展开为 384×232。收起操作会等待 600 ms 后收缩原生画布，插件应在此之前完成视觉过渡；后续展开会取消这次收缩。可选接口不可用时，插件应自行退回原来的 320×74 / 400×200 布局。纯界面模拟预览不验证游戏识别或系统置顶。
+
+声明 `music.read` 的插件使用较高的展开画布 400×(topInset+382)，建议内容为 384×372；其他插件沿用原尺寸。新增接口均为可选，应检测方法是否存在。详见 [音乐与频道接口](docs/media-and-channels.md)。
 
 宿主最多安装 16 个、同时启用 3 个插件；单个插件连续两次超过 192 MiB 工作集预算时暂停。不同插件的窗口、权限与会话相互隔离，反复开启同一插件会复用其受限会话，关闭窗口后释放渲染进程。
 
 ## 宿主集成
 
-`host/plugin-host.cjs` 导出 `PluginHost`。Electron 主进程在 ready 前注册 `relink-plugin` 为 standard / secure / supportFetchAPI 自定义协议，在 ready 后调用 `initialize()`。构造参数为 `app, BrowserWindow, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit`。
+`host/plugin-host.cjs` 导出 `PluginHost`。Electron 主进程在 ready 前注册 `relink-plugin` 为 standard / secure / supportFetchAPI 自定义协议，在 ready 后调用 `initialize()`。构造参数为 `app, BrowserWindow, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit`，可选 `listGameWindows` 返回本机游戏候选窗口，供宿主使用自带名单判断游戏模式；不提供时保持常规模式。置顶使用系统窗口层级，不保证覆盖独占全屏、安全桌面或被系统限制的窗口。
 
 可信主窗口使用以下固定 IPC；`trustedIpc` 必须同时检查主窗口、主 frame 和实际应用页面来源：
 
@@ -89,3 +98,11 @@ stop();
 - `tests/`：授权边界测试。
 
 请参阅 [SECURITY.md](SECURITY.md) 与 [LICENSE](LICENSE)。
+
+## 浮岛使用说明
+
+网易云音乐需要在「设置 → 系统」勾选「开启 SMTC」。插件按播放器进程启动时间锁定先打开的一款；暂停或另一款开始播放不会抢占，只有退出当前播放器进程才会切换。关闭主窗口可能只是最小化到托盘。完整教程位于官网插件中心 `/plugin-center/float.html`（当前为本地待发布内容）。
+
+## 作者与插件设置
+
+参阅 [作者与独立设置](docs/settings.md)，声明作者头像、开关和滑条，并让插件与 Relink 设置页实时同步。
