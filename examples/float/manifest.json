@@ -1,7 +1,7 @@
 {
   "id": "relink-float",
   "name": "Relink 浮岛",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "apiVersion": 2,
   "entry": "index.html",
   "description": "黑白浮岛：音乐封面、同步歌词、播放控制、通话与频道切换，游戏时自动贴顶。",
@@ -22,6 +22,12 @@
     "avatar": "author.png"
   },
   "settings": [
+    {
+      "key": "followSystemMotion",
+      "label": "跟随系统动画设置（关闭后启用完整动画）",
+      "type": "toggle",
+      "default": true
+    },
     {
       "key": "orbit",
       "label": "环绕光效",

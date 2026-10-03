@@ -13,6 +13,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include "cursor-policy.h"
 using namespace std::chrono_literals;
 using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::Media::Control;
@@ -76,6 +77,14 @@ JsonArray players(){
 // The hook only queues button-down points. Pipe I/O happens outside the hook,
 // and every input is passed on unchanged to the game/application.
 constexpr UINT PointerDownMessage = WM_APP + 1;
+bool cursorInteractive(HWND foreground) {
+ CURSORINFO info{};info.cbSize=sizeof(info);RECT clip{};
+ GUITHREADINFO gui{};gui.cbSize=sizeof(gui);
+ const auto thread=foreground?GetWindowThreadProcessId(foreground,nullptr):0;
+ if(!thread||!GetGUIThreadInfo(thread,&gui)||gui.hwndCapture||!GetCursorInfo(&info)||!GetClipCursor(&clip))return false;
+ return info.hCursor && (info.flags&CURSOR_SHOWING)!=0 && (info.flags&CURSOR_SUPPRESSED)==0
+  && clip.right-clip.left>4 && clip.bottom-clip.top>4;
+}
 LRESULT CALLBACK pointerHook(int code, WPARAM message, LPARAM data) {
  if(code>=0 && (message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN||message==WM_XBUTTONDOWN)) {
   const auto point=reinterpret_cast<MSLLHOOKSTRUCT*>(data)->pt;
@@ -88,10 +97,19 @@ int watchPointer(DWORD parentId) {
  MSG message{};PeekMessageW(&message,nullptr,0,0,PM_NOREMOVE);
  const auto hook=SetWindowsHookExW(WH_MOUSE_LL,pointerHook,GetModuleHandleW(nullptr),0);
  if(!hook){CloseHandle(parent);return 3;}
- const auto timer=SetTimer(nullptr,0,1000,nullptr);
+ const auto timer=SetTimer(nullptr,0,100,nullptr);
+ if(!timer){UnhookWindowsHookEx(hook);CloseHandle(parent);return 4;}
+ CursorReleaseGate gate;
+ auto sample=[&](){const auto foreground=GetForegroundWindow();return gate.update(cursorInteractive(foreground),reinterpret_cast<std::uintptr_t>(foreground),GetTickCount64());};
+ bool interactive=sample();
+ std::cout<<"CURSOR "<<(interactive?1:0)<<std::endl;
  std::cout<<"READY"<<std::endl;
  while(GetMessageW(&message,nullptr,0,0)>0) {
   if(message.message==WM_TIMER&&WaitForSingleObject(parent,0)!=WAIT_TIMEOUT)break;
+  if(message.message==WM_TIMER) {
+   const bool next=sample();
+   if(next!=interactive){interactive=next;std::cout<<"CURSOR "<<(interactive?1:0)<<std::endl;}
+  }
   if(message.message==PointerDownMessage)std::cout<<"DOWN "<<static_cast<LONG>(message.wParam)<<" "<<static_cast<LONG>(message.lParam)<<std::endl;
   if(!std::cout.good())break;
  }

@@ -5,7 +5,7 @@ const path = require('node:path');
 // One event-driven helper per host. Coordinates stay in the trusted host;
 // sandboxed plugins receive only a dismissal, never global mouse activity.
 class PluginPointer {
-  constructor(onDown) { this.onDown = onDown; }
+  constructor(onDown, onCursor = () => {}) { this.onDown = onDown; this.onCursor = onCursor; }
   start() {
     if (this.child || process.platform !== 'win32' || Date.now() < (this.retryAt || 0)) return;
     const executable = [path.join(process.resourcesPath || '', 'plugin-native/RelinkMediaBridge.exe'), path.join(__dirname, '../plugin-sdk/native/bin/RelinkMediaBridge.exe'), path.join(__dirname, '../native/bin/RelinkMediaBridge.exe')].find(p => fs.existsSync(p));
@@ -16,16 +16,18 @@ class PluginPointer {
     child.on('error', fail); child.on('exit', fail);
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
+      if (this.child !== child) return;
       buffer += chunk; if (buffer.length > 16384) return fail();
       let end;
       while ((end = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0,end).trim(); buffer = buffer.slice(end+1);
         if (line === 'READY') { this.ready = true; continue; }
+        if (/^CURSOR [01]$/.test(line)) { this.onCursor(line === 'CURSOR 1'); continue; }
         const match = /^DOWN (-?\d{1,8}) (-?\d{1,8})$/.exec(line);
         if (match) this.onDown({ x:Number(match[1]), y:Number(match[2]) });
       }
     });
   }
-  stop() { const child = this.child; this.child = null; this.ready = false; child?.kill(); }
+  stop() { const child = this.child; this.child = null; this.ready = false; this.onCursor(false); child?.kill(); }
 }
 module.exports = { PluginPointer };

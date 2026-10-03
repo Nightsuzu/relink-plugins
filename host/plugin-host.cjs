@@ -18,7 +18,8 @@ class PluginHost {
     this.updates = new PluginUpdates(this);
     this.records = new Map(); this.preferences = {}; this.state = sanitizeState();
     this.services = new PluginServices(this, mediaService);
-    this.pointer = new PluginPointer(point => this.pointerDown(this.screen.screenToDipPoint(point)));
+    this.cursorInteractive = false;
+    this.pointer = new PluginPointer(point => this.pointerDown(this.screen.screenToDipPoint(point)), value => this.setCursorInteractive(value));
     this.disposed = false; this.incident = null; this.queue = Promise.resolve(); this.gameMode = false;
     this.displayChanged = () => { for (const r of this.records.values()) if (r.window) this.position(r); };
   }
@@ -99,7 +100,7 @@ class PluginHost {
       const existing = this.records.get(item.manifest.id);
       if (existing?.builtin) throw new Error('内置插件随 Relink 更新。');
       if (!existing && this.records.size >= 16) throw new Error('最多安装 16 个插件。');
-      const labels = { 'voice.read':'读取通话状态','voice.mute':'控制麦克风静音','voice.deafen':'控制耳机拒听','app.show':'返回主窗口','window.resize':'调整插件浮窗','music.read':'读取支持的播放器曲目和封面','music.control':'控制播放器','music.lyrics':'匹配 LRCLIB 同步歌词','channels.read':'读取当前 Room 语音频道','channels.switch':'切换语音频道' };
+      const labels = { 'voice.read':'读取通话状态','voice.mute':'控制麦克风静音','voice.deafen':'控制耳机拒听','app.show':'返回主窗口','window.resize':'调整插件浮窗','music.read':'读取支持的播放器曲目和封面','music.control':'控制播放器','music.lyrics':'匹配同步歌词（QQ 音乐、网易云、LRCLIB）','channels.read':'读取当前 Room 语音频道','channels.switch':'切换语音频道' };
       const options = { type:'question',title:existing ? '更新 Relink 插件' : '安装 Relink 插件',message:`${item.manifest.name} · v${item.manifest.version}`,detail:`${item.manifest.description}\n\n允许的功能：${item.manifest.capabilities.map(c => labels[c]).join('、') || '无'}\n\n已验证 Relink 发布签名。安装后默认关闭，可在设置 → 插件中开启。`,buttons:[existing ? '更新插件' : '安装插件','取消'],defaultId:0,cancelId:1,noLink:true };
       const main = this.getWindow();
       const confirm = main && !main.isDestroyed() ? await this.dialog.showMessageBox(main, options) : await this.dialog.showMessageBox(options);
@@ -189,6 +190,7 @@ class PluginHost {
       const r = plugin(event);
       if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
       if (!['compact','expanded','notch'].includes(value) || (value === 'notch' && !this.gameMode)) throw new Error('显示状态无效。');
+      if (this.gameMode && !this.cursorInteractive && value !== 'notch') throw new Error('游戏正在使用鼠标。');
       if (!r.resizeLimit()) throw new Error('操作过于频繁。');
       r.gameAware = true; r.displayState = value;
       void this.resize(r, value === 'expanded');
@@ -197,7 +199,21 @@ class PluginHost {
   }
   presentation(r) {
     const display = this.screen.getAllDisplays().find(d => String(d.id) === this.pref(r.manifest.id).displayId) || this.screen.getPrimaryDisplay();
-    return { gameMode: this.gameMode, topInset: Math.max(18, Math.min(128, display.workArea.y - display.bounds.y + 18)) };
+    return { gameMode: this.gameMode, hoverAllowed: !this.gameMode || this.cursorInteractive, topInset: Math.max(18, Math.min(128, display.workArea.y - display.bounds.y + 18)) };
+  }
+  setCursorInteractive(value) {
+    if (this.cursorInteractive === value) return;
+    this.cursorInteractive = value === true;
+    if (!this.gameMode || this.disposed) return;
+    for (const r of this.records.values()) {
+      if (!r.gameAware || !r.window || r.window.isDestroyed()) continue;
+      if (!this.cursorInteractive) {
+        r.displayState = 'notch';
+        void this.resize(r, false);
+      }
+      this.position(r);
+      r.window.webContents.send('relink:plugin:presentation', this.presentation(r));
+    }
   }
   pointerDown(point) {
     for (const r of this.records.values()) {
@@ -240,6 +256,7 @@ class PluginHost {
     r.resizeResolve?.(); r.resizeResolve = null;
   }
   resize(r, expanded) {
+    if (expanded && this.gameMode && !this.cursorInteractive) return Promise.reject(new Error('游戏正在使用鼠标。'));
     this.cancelResize(r);
     // Older API-v1 plugins expect immediate resize and do not opt into the
     // presentation/morph contract. Keep their behaviour unchanged.
@@ -267,17 +284,25 @@ class PluginHost {
     const topInset = this.presentation(r).topInset;
     // Windows clamps even a frameless native window to 38 DIP. The visible
     // notch stays 28 DIP and its input shape excludes the transparent remainder.
-    const width = Math.min(r.expanded ? 400 : notch ? 204 : 320, a.width), height = Math.min(r.expanded ? (r.gameAware ? (r.manifest.capabilities.includes('music.read') ? 382 : 242) + topInset : 200) : notch ? 38 : r.gameAware ? topInset + 70 : 74, a.height);
+    // Keep the compositor canvas and screen origin constant across all morphs.
+    // Resizing HWND and then re-centering the renderer can expose one frame of
+    // displaced text. Shape changes below still let clicks pass through the
+    // unused canvas; this does not make the invisible margin interactive.
+    const width = Math.min(r.gameAware || r.expanded ? 400 : 320, a.width);
+    const height = Math.min(r.gameAware ? (r.manifest.capabilities.includes('music.read') ? 382 : 242) + topInset : r.expanded ? 200 : 74, a.height);
     // Presentation-aware windows share one screen-edge anchor. The renderer
     // spring moves the pill to/from the notch, avoiding a native 10px jump.
     const bounds = { x: Math.round(a.x + (a.width - width) / 2), y: a.y + (r.gameAware ? 0 : Math.min(10, Math.max(0, a.height - height))), width, height };
     const previous = r.window.getBounds();
     if (Object.keys(bounds).some(key => previous[key] !== bounds[key])) r.window.setBounds(bounds, false);
     if (process.platform === 'win32' && r.gameAware) {
+      const ignore = gameMode && !this.cursorInteractive;
+      if (r.ignoringMouse !== ignore) { r.window.setIgnoreMouseEvents(ignore); r.ignoringMouse = ignore; }
       // A game notch must accept pointer input without taking keyboard focus
       // away from the game. Normal desktop mode retains keyboard navigation.
       if (r.focusable !== !gameMode) { r.window.setFocusable(!gameMode); r.focusable = !gameMode; }
-      const shape = r.expanded ? { x:0,y:0,width,height } : { x:8,y:gameMode ? 0 : topInset,width:Math.max(1,width-16),height:notch ? 28 : 58 };
+      const visibleWidth = Math.min(notch ? 188 : 304, Math.max(1,width-16));
+      const shape = r.expanded ? { x:0,y:0,width,height } : { x:Math.floor((width-visibleWidth)/2),y:gameMode ? 0 : topInset,width:visibleWidth,height:notch ? 28 : 58 };
       r.window.setShape([shape]);
     }
   }
@@ -310,7 +335,7 @@ class PluginHost {
         r.session = ses;
       }
       const w = new this.BrowserWindow({ width: 320, height: 74, minWidth: 0, minHeight: 0, thickFrame: false, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false, maximizable: false, minimizable: false, fullscreenable: false, skipTaskbar: true, alwaysOnTop: true, show: false, hasShadow: false, title: r.manifest.name, webPreferences: { preload: path.join(__dirname, 'plugin-preload.cjs'), session: ses, nodeIntegration: false, nodeIntegrationInWorker: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, spellcheck: false, devTools: false, backgroundThrottling: true } });
-      r.window = w; r.expanded = false; r.gameAware = false; r.displayState = null; r.focusable = true; r.limit = limiter(); r.resizeLimit = limiter(24); r.settingsLimit = limiter(30); r.overBudget = 0;
+      r.window = w; r.expanded = false; r.gameAware = false; r.displayState = null; r.focusable = true; r.ignoringMouse = undefined; r.limit = limiter(); r.resizeLimit = limiter(24); r.settingsLimit = limiter(30); r.overBudget = 0;
       w.on('blur', () => { if (!this.gameMode && r.displayState === 'expanded') w.webContents.send('relink:plugin:dismiss'); });
       w.setAlwaysOnTop(true, 'screen-saver');
       w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });

@@ -53,7 +53,7 @@ stop();
 | `window.resize` | 展开或收起插件胶囊 |
 | `music.read` | 读取支持的本机播放器曲目、封面和播放状态 |
 | `music.control` | 控制所选媒体会话播放、暂停、上一首、下一首 |
-| `music.lyrics` | 宿主通过 LRCLIB 匹配同步歌词 |
+| `music.lyrics` | 宿主通过 LRCLIB 和当前播放器的公开曲库匹配同步歌词 |
 | `channels.read` | 读取当前 Room 的语音频道列表 |
 | `channels.switch` | 通过主客户端正常鉴权流程切换频道 |
 

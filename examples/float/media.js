@@ -5,7 +5,6 @@
   const names={qqmusic:'QQ 音乐',netease:'网易云音乐',soda:'汽水音乐'};
   let snapshot={sessions:[]},manual=false,view='voice',track=null,polling=null,pending=0,closed=false,channelBusy=false,channelState={scope:'',channels:[]},lastChannels='',lyricsKey='',trackKey='';
   let light=true;try{light=localStorage.getItem('orbit')!=='off';}catch{}
-  const motion=matchMedia('(prefers-reduced-motion: reduce)');
   island.classList.toggle('light-on',light);el('light').setAttribute('aria-pressed',String(light));
   function applySettings(value){if(typeof value.orbit==='boolean'){light=value.orbit;island.classList.toggle('light-on',light);el('light').setAttribute('aria-pressed',String(light));el('light').setAttribute('aria-label',light?'关闭环绕光效':'开启环绕光效');}}
   const offSettings=b.onSettings?.(applySettings);b.getSettings?.().then(applySettings).catch(()=>{});
@@ -18,7 +17,7 @@
   for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>{if(manual&&view===button.dataset.view){manual=false;show(track?'music':'voice');}else show(button.dataset.view,true);};
   window.floatAutoView=()=>{manual=false;show(track||snapshot.activeSource?'music':'voice');};
   function message(value){el('notice').textContent=value;}
-  function animate(element){if(motion.matches)return;element.getAnimations().forEach(a=>a.cancel());element.animate([{opacity:.35,transform:'translateY(3px)'},{opacity:1,transform:'translateY(0)'}],{duration:230,easing:'cubic-bezier(.2,.8,.2,1)'});}
+  function animate(element){if(window.floatReduceMotion())return;element.getAnimations().forEach(a=>a.cancel());element.animate([{opacity:.35},{opacity:1}],{duration:230,easing:'cubic-bezier(.2,.8,.2,1)'});}
   function summary(){
     if(window.floatHeaderChanging)return;
     const has=!!track;window.floatHasMusic=has;island.classList.toggle('has-music',has);island.classList.toggle('music-cover',!!track?.cover);island.classList.toggle('playing',!!track?.playing);
@@ -56,7 +55,7 @@
     const position=Math.min(track.durationMs||86400000,track.positionMs+elapsed);
     el('elapsed').textContent=track.durationMs?time(position):'--:--';el('duration').textContent=track.durationMs?time(track.durationMs):'进度未提供';el('progress').value=track.durationMs?position/track.durationMs:0;
     const lines=track.lyrics?.lines||[];let index=-1;for(let i=0;i<lines.length&&lines[i].time<=position;i++)index=i;
-    const status=track.lyrics?.status,now=index>=0?lines[index].text:status==='instrumental'?'纯音乐 · 静静聆听':status==='loading'?'正在匹配歌词':status==='synced'?'前奏':status==='disabled'?'歌词权限未开启':'暂无匹配的同步歌词';
+    const status=track.lyrics?.status,now=index>=0?lines[index].text:status==='instrumental'?'纯音乐 · 静静聆听':status==='loading'?'正在匹配歌词':status==='synced'?'前奏':status==='disabled'?'歌词权限未开启':status==='waiting'?'等待完整歌曲信息':status==='retrying'?'歌词连接暂不可用，稍后重试':'暂无匹配的同步歌词';
     el('compact-progress').value=track.durationMs?position/track.durationMs:0;
     if(!window.floatHeaderChanging&&!window.floatHeaderExpanded)el('status').textContent=now;
     const next=lines[index+1]?.text||'';const key=now+'\n'+next;

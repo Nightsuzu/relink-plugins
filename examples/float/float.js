@@ -1,15 +1,27 @@
 'use strict';
 const bridge = window.relinkPlugin, $ = id => document.getElementById(id);
 const card = $('island'), reduced = matchMedia('(prefers-reduced-motion: reduce)');
+let followSystemMotion = true;
+const reduceMotion = () => followSystemMotion && reduced.matches;
+window.floatReduceMotion = reduceMotion;
+function syncMotionPolicy() {
+  document.documentElement.classList.toggle('reduce-motion', reduceMotion());
+  document.documentElement.classList.toggle('full-motion', !followSystemMotion);
+}
+syncMotionPolicy();
 const presentationAware = typeof bridge.getPresentation === 'function';
 card.classList.toggle('legacy', !presentationAware);
 let expanded = false, gameMode = false, hovered = false, topInset = presentationAware ? 18 : 8, epoch = 0, lastState = {}, pending = null;
+let hoverAllowed = true;
 let displayState = 'compact', headerTimer, autoViewTimer, headerAnimation, leaveTimer, hoverBlocked = false;
 let pointerPosition = null;
 window.floatHeaderExpanded = false;
 let notchTransparency=15;try{notchTransparency=Math.max(0,Math.min(85,Number(localStorage.getItem('notch-transparency') ?? 15)||0));}catch{}
-function applyPluginSettings(value){if(Number.isFinite(value.notchTransparency)){notchTransparency=value.notchTransparency;$('notch-opacity').value=String(notchTransparency);$('notch-opacity-value').textContent=notchTransparency+'%';morph();}}
-let frame = 0, previousTime = 0, started = 0, disposed = false;
+function applyPluginSettings(value){
+  if(typeof value.followSystemMotion==='boolean' && followSystemMotion!==value.followSystemMotion){followSystemMotion=value.followSystemMotion;motionPreferenceChanged();}
+  if(Number.isFinite(value.notchTransparency)){notchTransparency=value.notchTransparency;$('notch-opacity').value=String(notchTransparency);$('notch-opacity-value').textContent=notchTransparency+'%';morph();}
+}
+let frame = 0, previousTime = 0, animationTime = 0, disposed = false;
 // A small analytical spring preserves velocity on reversal. It runs only during
 // a morph; no idle loop, native resize per frame, blur pass or third-party runtime.
 const values = [304, 58, 29, topInset, .88, 29], velocity = [0, 0, 0, 0, 0, 0];
@@ -23,6 +35,7 @@ function settle() { values.splice(0, values.length, ...target); velocity.fill(0)
 function step(time) {
   frame = 0; if (disposed) return;
   const dt = Math.min((time - previousTime) / 1000, .05); previousTime = time;
+  animationTime += dt * 1000;
   const damping = 19, frequency = Math.sqrt(500 - damping * damping);
   const decay = Math.exp(-damping * dt), sin = Math.sin(frequency * dt), cos = Math.cos(frequency * dt);
   let resting = true;
@@ -33,7 +46,9 @@ function step(time) {
     const epsilon = i === 4 ? .0005 : .08;
     if (Math.abs(values[i] - target[i]) > epsilon || Math.abs(velocity[i]) > epsilon * 10) resting = false;
   }
-  if (resting || time - started >= 540) settle();
+  // Count rendered spring time, not wall time: a delayed first frame after
+  // occlusion or a busy GPU must not turn the entire morph into an instant cut.
+  if (resting || animationTime >= 540) settle();
   else { paint(); frame = requestAnimationFrame(step); }
 }
 function morph() {
@@ -41,8 +56,8 @@ function morph() {
   target = expanded ? [384,presentationAware ? (typeof bridge.getMedia === 'function' ? 372 : 232) : 184,28,gameMode ? 0 : topInset] : notch ? [188,28,14,0] : [304,58,29,gameMode ? 0 : topInset];
   target.push(expanded ? 1 : notch ? 1-notchTransparency/100 : hovered ? .97 : .88);
   target.push(expanded?28:notch?0:29);
-  started = previousTime = performance.now();
-  if (reduced.matches) { cancelAnimationFrame(frame); frame = 0; settle(); }
+  previousTime = performance.now(); animationTime = 0;
+  if (reduceMotion()) { cancelAnimationFrame(frame); frame = 0; settle(); }
   else if (!frame) frame = requestAnimationFrame(step);
 }
 function headerMode(mode) {
@@ -52,19 +67,19 @@ function headerMode(mode) {
   const update = () => {
     card.classList.toggle('notch', mode === 'notch');
     card.classList.toggle('header-expanded', mode === 'expanded');
-    header.style.width = (mode === 'notch' ? 186 : mode === 'expanded' ? 382 : 302) + 'px';
+    header.style.width = (mode === 'notch' ? 186 : 302) + 'px';
     window.floatHeaderExpanded = mode === 'expanded'; window.floatHeaderChanging = false;
     window.floatRefreshSummary?.();
     headerAnimation?.cancel();
-    if (!reduced.matches) headerAnimation = header.animate([{opacity:0},{opacity:1}], {duration:180,delay:70,fill:'both',easing:'ease-out'});
+    if (!reduceMotion()) headerAnimation = header.animate([{opacity:0},{opacity:1}], {duration:180,delay:70,fill:'both',easing:'ease-out'});
   };
-  if (reduced.matches) update();
+  if (reduceMotion()) update();
   else { headerAnimation = header.animate([{opacity},{opacity:0}], {duration:80,fill:'forwards',easing:'ease-out'}); headerTimer = setTimeout(update,80); }
 }
 function semantic(next) {
   expanded = next; card.classList.toggle('expanded', next);
   clearTimeout(autoViewTimer);
-  if(!next) autoViewTimer = setTimeout(() => window.floatAutoView?.(), reduced.matches ? 0 : 160);
+  if(!next) autoViewTimer = setTimeout(() => window.floatAutoView?.(), reduceMotion() ? 0 : 160);
   $('summary').setAttribute('aria-expanded', String(next));
   $('summary').setAttribute('aria-label', next ? '收起浮岛' : '展开浮岛');
   $('details').inert = !next; $('details').setAttribute('aria-hidden', String(!next));
@@ -74,7 +89,7 @@ async function setExpanded(next) {
   return setDisplayState(next ? 'expanded' : gameMode ? 'notch' : 'compact');
 }
 async function setDisplayState(next) {
-  if (next === displayState) return;
+  if (next === displayState || (gameMode && !hoverAllowed && next !== 'notch')) return;
   clearTimeout(leaveTimer);
   const generation = ++epoch;
   const opening = next === 'expanded' || (displayState === 'notch' && next === 'compact');
@@ -124,10 +139,15 @@ function render(state) {
 }
 function presentation(value) {
   const inset = Number.isFinite(value.topInset) ? Math.max(18,Math.min(128,value.topInset)) : 18;
-  if (gameMode === (value.gameMode === true) && topInset === inset) return;
+  const allowed = value.hoverAllowed !== false;
+  if (gameMode === (value.gameMode === true) && topInset === inset && hoverAllowed === allowed) return;
+  const requireFreshHover = gameMode && !hoverAllowed;
+  hoverAllowed = allowed;
   topInset = inset;
   gameMode = value.gameMode === true; ++epoch;
   clearTimeout(leaveTimer); hovered = false; hoverBlocked = false;
+  pointerPosition = null;
+  hoverBlocked = gameMode && (requireFreshHover || !hoverAllowed);
   displayState = gameMode ? 'notch' : 'compact'; headerMode(displayState);
   semantic(false); card.classList.toggle('game', gameMode);
   $('mode').textContent = gameMode ? '游戏模式 · 贴顶收起' : '通话随身，桌面留白';
@@ -142,12 +162,12 @@ document.addEventListener('keydown', event => { if (event.key === 'Escape') { ev
 // the three-second grace period applies only to leaving without clicking.
 function dismiss() { clearTimeout(leaveTimer); hoverBlocked = true; void setExpanded(false); }
 card.addEventListener('pointerleave', () => { hovered = false; morph(); if (expanded || (gameMode && displayState === 'compact')) leaveTimer = setTimeout(() => void setExpanded(false), 3000); });
-card.addEventListener('pointerenter', () => { hovered = true; clearTimeout(leaveTimer); if(gameMode && displayState === 'notch' && !hoverBlocked) void setDisplayState('compact'); else morph(); });
+card.addEventListener('pointerenter', () => { hovered = true; clearTimeout(leaveTimer); if(gameMode && hoverAllowed && displayState === 'notch' && !hoverBlocked) void setDisplayState('compact'); else morph(); });
 card.addEventListener('pointermove', event => {
   const position = `${event.screenX},${event.screenY}`;
   // Native canvas contraction can synthesize leave/enter without moving the
   // pointer. Only fresh pointer movement rearms hover after an outside click.
-  if (hoverBlocked && pointerPosition !== null && position !== pointerPosition) {
+  if (hoverAllowed && hoverBlocked && pointerPosition !== null && position !== pointerPosition) {
     hoverBlocked = false;
     if (gameMode && displayState === 'notch') void setDisplayState('compact');
   }
@@ -158,7 +178,11 @@ const offDismiss = bridge.onDismiss?.(dismiss);
 $('notch-opacity').value=String(notchTransparency);$('notch-opacity-value').textContent=notchTransparency+'%';
 $('notch-opacity').addEventListener('input',()=>{notchTransparency=Number($('notch-opacity').value);$('notch-opacity-value').textContent=notchTransparency+'%';morph();});
 $('notch-opacity').addEventListener('change',()=>{if(bridge.updateSettings)void bridge.updateSettings({notchTransparency}).catch(()=>{$('notice').textContent='设置未保存，请稍后重试';});else try{localStorage.setItem('notch-transparency',String(notchTransparency));}catch{}});
-function motionPreferenceChanged() { if (reduced.matches) headerMode(displayState); morph(); }
+function motionPreferenceChanged() {
+  syncMotionPolicy();
+  if (reduceMotion()) { document.getAnimations().forEach(a=>a.cancel()); headerMode(displayState); }
+  morph();
+}
 reduced.addEventListener('change', motionPreferenceChanged);
 const offState = bridge.onState(render), offPresentation = bridge.onPresentation?.(presentation);
 const offSettings=bridge.onSettings?.(applyPluginSettings);bridge.getSettings?.().then(applyPluginSettings).catch(()=>{});

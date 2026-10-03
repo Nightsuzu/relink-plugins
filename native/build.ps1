@@ -1,3 +1,4 @@
+param([switch]$Test)
 $ErrorActionPreference = 'Stop'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -11,4 +12,11 @@ Push-Location $output
 try {
  & cl.exe /nologo /std:c++20 /EHsc /O2 /MT /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 (Join-Path $PSScriptRoot 'media-bridge.cpp') /Fe:RelinkMediaBridge.exe /link windowsapp.lib crypt32.lib user32.lib
  if ($LASTEXITCODE -ne 0) { throw 'Media bridge build failed.' }
+ if ($Test) {
+  & cl.exe /nologo /std:c++20 /EHsc /O2 /MT (Join-Path $PSScriptRoot 'cursor-policy.test.cpp') /Fe:CursorPolicyTest.exe
+  if ($LASTEXITCODE -ne 0) { throw 'Cursor policy test build failed.' }
+  & (Join-Path $output 'CursorPolicyTest.exe')
+  if ($LASTEXITCODE -ne 0) { throw 'Cursor policy test failed.' }
+  Write-Output 'Cursor release policy tests passed.'
+ }
 } finally { Pop-Location }

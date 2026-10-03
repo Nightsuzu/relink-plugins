@@ -23,8 +23,8 @@ export interface PluginBridge {
   /** Host-filtered outside click/focus loss. Does not expose global input data. */
   onDismiss?(callback:()=>void):()=>void;
   /** Requires window.resize. Optional on older hosts; contains no process identity. */
-  getPresentation?(): Promise<{ gameMode: boolean; topInset: number }>;
-  onPresentation?(callback: (presentation: { gameMode: boolean; topInset: number }) => void): () => void;
+  getPresentation?(): Promise<{ gameMode: boolean; topInset: number; hoverAllowed?: boolean }>;
+  onPresentation?(callback: (presentation: { gameMode: boolean; topInset: number; hoverAllowed?: boolean }) => void): () => void;
 }
 export interface MusicSession {
   id:string;current:boolean;source:'qqmusic'|'netease'|'soda';track:string;title:string;artist:string;album:string;

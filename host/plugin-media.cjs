@@ -73,27 +73,63 @@ class PluginMedia {
       }}).catch(()=>{if(generation===this.generation)this.snapshot={available:false,activeSource:this.selectedPlayer?.source||'',sessions:[],updatedAt:Date.now()};}).finally(()=>{this.reading=null;});
     }
     if(this.reading)await this.reading;
-    if(lyrics) for(const track of this.snapshot.sessions) if(track.playing) void this.loadLyrics(track);
-    return {...this.snapshot,sessions:this.snapshot.sessions.map(t=>({...t,lyrics:lyrics?(this.cache.get(t.track)||{status:t.playing?'loading':'idle',lines:[]}):{status:'disabled',lines:[]}}))};
+    if(lyrics) for(const track of this.snapshot.sessions) void this.loadLyrics(track);
+    return {...this.snapshot,sessions:this.snapshot.sessions.map(t=>({...t,lyrics:lyrics?(this.cache.get(this.lyricKey(t))||{status:t.title&&t.artist&&t.durationMs>0?'loading':'waiting',lines:[]}):{status:'disabled',lines:[]}}))};
+  }
+  lyricKey(track) { return JSON.stringify([track.source,track.title,track.artist,track.album,track.durationMs]); }
+  async lyricJson(url,controller,referer) {
+    const response=await this.fetch(url,{signal:AbortSignal.any([controller.signal,AbortSignal.timeout(4000)]),redirect:'error',credentials:'omit',headers:{'User-Agent':'Relink-Float (https://relinkus.cn/plugins/)',...(referer?{Referer:referer}:{})}});
+    if(response.status===404)return null;
+    if(!response.ok||Number(response.headers.get('content-length'))>200000)throw new Error('unavailable');
+    const chunks=[];let size=0;
+    for await(const chunk of response.body){size+=chunk.length;if(size>200000){controller.abort();throw new Error('oversize');}chunks.push(Buffer.from(chunk));}
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  }
+  async playerLyrics(track,controller) {
+    // Only query the detected player's public catalog; no player cookies,
+    // account tokens, arbitrary URLs or unmatched song IDs cross this boundary.
+    if(track.source==='qqmusic') {
+      const search=await this.lyricJson('https://c.y.qq.com/soso/fcgi-bin/client_search_cp?'+new URLSearchParams({w:track.title+' '+track.artist,format:'json',p:'1',n:'8'}),controller,'https://y.qq.com/');
+      const song=(search?.data?.song?.list||[]).slice(0,8).find(s=>matchingLyrics(track,{trackName:s.songname,artistName:s.singer?.map(a=>a.name).join(' / '),albumName:s.albumname,duration:s.interval}));
+      if(!song||!/^[A-Za-z0-9]{10,32}$/.test(song.songmid))return null;
+      const data=await this.lyricJson('https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?'+new URLSearchParams({songmid:song.songmid,format:'json',nobase64:'1'}),controller,'https://y.qq.com/');
+      const lines=data?.code===0?parseLrc(data.lyric):[];
+      return lines.length?{status:'synced',lines,source:'QQ Music'}:null;
+    }
+    if(track.source==='netease') {
+      const search=await this.lyricJson('https://music.163.com/api/search/get?'+new URLSearchParams({s:track.title+' '+track.artist,type:'1',limit:'8',offset:'0'}),controller,'https://music.163.com/');
+      const song=(search?.result?.songs||[]).slice(0,8).find(s=>matchingLyrics(track,{trackName:s.name,artistName:s.artists?.map(a=>a.name).join(' / '),albumName:s.album?.name,duration:s.duration/1000}));
+      if(!song||!Number.isSafeInteger(song.id)||song.id<=0)return null;
+      const data=await this.lyricJson('https://music.163.com/api/song/lyric?'+new URLSearchParams({id:String(song.id),lv:'-1',kv:'-1',tv:'-1'}),controller,'https://music.163.com/');
+      const lines=data?.code===200?parseLrc(data.lrc?.lyric):[];
+      return lines.length?{status:'synced',lines,source:'NetEase Music'}:null;
+    }
+    return null;
   }
   async loadLyrics(track) {
-    if(this.cache.has(track.track)||this.jobs.has(track.track)||this.jobs.size>=2)return;
-    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);this.jobs.set(track.track,controller);
+    // SMTC metadata can arrive in pieces. Never poison a song's cache while
+    // its duration/artist is still missing, and load paused songs as well.
+    if(!track.title||!track.artist||track.durationMs<=0)return;
+    const key=this.lyricKey(track),cached=this.cache.get(key);
+    if((cached&&cached.retryAt>Date.now())||this.jobs.has(key)||this.jobs.size>=2)return;
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);this.jobs.set(key,controller);
     const generation=this.generation;
-    let result={status:'unavailable',lines:[]};
+    let result={status:'unavailable',lines:[]},failed=false;
     try {
-      if(!track.title||!track.artist||track.durationMs<=0)return;
       const params=new URLSearchParams({track_name:track.title,artist_name:track.artist,album_name:track.album,duration:String(Math.round(track.durationMs/1000))});
-      const response=await this.fetch('https://lrclib.net/api/get?'+params,{signal:controller.signal,redirect:'error',credentials:'omit',headers:{'User-Agent':'Relink-Float/0.3.0 (https://relinkus.cn/plugins/)'}});
-      if(!response.ok||Number(response.headers.get('content-length'))>200000)throw new Error('unavailable');
-      const chunks=[];let size=0;for await(const chunk of response.body){size+=chunk.length;if(size>200000){controller.abort();throw new Error('oversize');}chunks.push(Buffer.from(chunk));}
-      const data=JSON.parse(Buffer.concat(chunks).toString('utf8'));if(matchingLyrics(track,data)){
-        const lines=parseLrc(data.syncedLyrics);result={status:data.instrumental?'instrumental':lines.length?'synced':'unavailable',lines,source:'LRCLIB'};
+      try {
+        const data=await this.lyricJson('https://lrclib.net/api/get?'+params,controller);
+        if(matchingLyrics(track,data)){
+          const lines=parseLrc(data.syncedLyrics);result={status:data.instrumental?'instrumental':lines.length?'synced':'unavailable',lines,source:'LRCLIB'};
+        }
+      } catch { failed=true; }
+      if(result.status==='unavailable'&&!controller.signal.aborted) {
+        try { result=(await this.playerLyrics(track,controller))||result; } catch { failed=true; }
       }
-    }catch{/* Lyrics failure never interrupts transport. */}
-    finally{
-      clearTimeout(timer);if(this.jobs.get(track.track)===controller)this.jobs.delete(track.track);
-      if(generation===this.generation){this.cache.set(track.track,result);while(this.cache.size>24)this.cache.delete(this.cache.keys().next().value);}
+      if(result.status==='unavailable'&&failed)result.status='retrying';
+    } finally {
+      clearTimeout(timer);if(this.jobs.get(key)===controller)this.jobs.delete(key);
+      if(generation===this.generation){this.cache.set(key,{...result,retryAt:Date.now()+(result.status==='retrying'?30000:result.status==='unavailable'?300000:3600000)});while(this.cache.size>24)this.cache.delete(this.cache.keys().next().value);}
     }
   }
   control(value) {
