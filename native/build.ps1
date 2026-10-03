@@ -9,6 +9,6 @@ $output = Join-Path $PSScriptRoot 'bin'
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 Push-Location $output
 try {
- & cl.exe /nologo /std:c++20 /EHsc /O2 /MT /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 (Join-Path $PSScriptRoot 'media-bridge.cpp') /Fe:RelinkMediaBridge.exe /link windowsapp.lib crypt32.lib
+ & cl.exe /nologo /std:c++20 /EHsc /O2 /MT /utf-8 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 (Join-Path $PSScriptRoot 'media-bridge.cpp') /Fe:RelinkMediaBridge.exe /link windowsapp.lib crypt32.lib user32.lib
  if ($LASTEXITCODE -ne 0) { throw 'Media bridge build failed.' }
 } finally { Pop-Location }

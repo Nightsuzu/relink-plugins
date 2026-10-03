@@ -18,6 +18,10 @@ export interface PluginBridge {
   getState(): Promise<PluginState>;
   onState(callback: (state: PluginState) => void): () => void;
   action(action: PluginAction): Promise<void>;
+  /** window.resize; three-stage overlay. Notch is available in game mode only. */
+  setDisplayState?(state:'notch'|'compact'|'expanded'):Promise<void>;
+  /** Host-filtered outside click/focus loss. Does not expose global input data. */
+  onDismiss?(callback:()=>void):()=>void;
   /** Requires window.resize. Optional on older hosts; contains no process identity. */
   getPresentation?(): Promise<{ gameMode: boolean; topInset: number }>;
   onPresentation?(callback: (presentation: { gameMode: boolean; topInset: number }) => void): () => void;

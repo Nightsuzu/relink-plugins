@@ -10,6 +10,13 @@ contextBridge.exposeInMainWorld('relinkPlugin', Object.freeze({
   switchChannel: value => ipcRenderer.invoke('relink:plugin:switch-channel', value),
   getState: () => ipcRenderer.invoke('relink:plugin:state'),
   action: name => ipcRenderer.invoke('relink:plugin:action', name),
+  setDisplayState: value => ipcRenderer.invoke('relink:plugin:display-state', value),
+  onDismiss: callback => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = () => callback();
+    ipcRenderer.on('relink:plugin:dismiss', listener);
+    return () => ipcRenderer.removeListener('relink:plugin:dismiss', listener);
+  },
   getPresentation: () => ipcRenderer.invoke('relink:plugin:presentation'),
   onPresentation: callback => {
     if (typeof callback !== 'function') return () => {};

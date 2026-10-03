@@ -73,7 +73,32 @@ JsonArray players(){
  }while(Process32NextW(snap,&p));CloseHandle(snap);
  JsonArray rows;for(const auto& [source,started]:first){JsonObject row;row.Insert(L"source",str(source));row.Insert(L"started",num(started));rows.Append(row);}cached=rows;last=now;return rows;
 }
-int main(){
+// The hook only queues button-down points. Pipe I/O happens outside the hook,
+// and every input is passed on unchanged to the game/application.
+constexpr UINT PointerDownMessage = WM_APP + 1;
+LRESULT CALLBACK pointerHook(int code, WPARAM message, LPARAM data) {
+ if(code>=0 && (message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN||message==WM_XBUTTONDOWN)) {
+  const auto point=reinterpret_cast<MSLLHOOKSTRUCT*>(data)->pt;
+  PostThreadMessageW(GetCurrentThreadId(),PointerDownMessage,static_cast<WPARAM>(point.x),static_cast<LPARAM>(point.y));
+ }
+ return CallNextHookEx(nullptr,code,message,data);
+}
+int watchPointer(DWORD parentId) {
+ HANDLE parent=OpenProcess(SYNCHRONIZE,FALSE,parentId);if(!parent)return 2;
+ MSG message{};PeekMessageW(&message,nullptr,0,0,PM_NOREMOVE);
+ const auto hook=SetWindowsHookExW(WH_MOUSE_LL,pointerHook,GetModuleHandleW(nullptr),0);
+ if(!hook){CloseHandle(parent);return 3;}
+ const auto timer=SetTimer(nullptr,0,1000,nullptr);
+ std::cout<<"READY"<<std::endl;
+ while(GetMessageW(&message,nullptr,0,0)>0) {
+  if(message.message==WM_TIMER&&WaitForSingleObject(parent,0)!=WAIT_TIMEOUT)break;
+  if(message.message==PointerDownMessage)std::cout<<"DOWN "<<static_cast<LONG>(message.wParam)<<" "<<static_cast<LONG>(message.lParam)<<std::endl;
+  if(!std::cout.good())break;
+ }
+ KillTimer(nullptr,timer);UnhookWindowsHookEx(hook);CloseHandle(parent);return 0;
+}
+int main(int argc,char** argv){
+ if(argc==3&&std::string(argv[1])=="--pointer-watch")return watchPointer(static_cast<DWORD>(std::stoul(argv[2])));
  winrt::init_apartment(winrt::apartment_type::multi_threaded);
  GlobalSystemMediaTransportControlsSessionManager manager{nullptr};std::map<std::wstring,Entry> entries;unsigned serial=0;
  // Fixed request size prevents a malformed parent from allocating an unbounded line.

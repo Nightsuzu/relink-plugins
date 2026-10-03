@@ -20,9 +20,10 @@
   function message(value){el('notice').textContent=value;}
   function animate(element){if(motion.matches)return;element.getAnimations().forEach(a=>a.cancel());element.animate([{opacity:.35,transform:'translateY(3px)'},{opacity:1,transform:'translateY(0)'}],{duration:230,easing:'cubic-bezier(.2,.8,.2,1)'});}
   function summary(){
+    if(window.floatHeaderChanging)return;
     const has=!!track;window.floatHasMusic=has;island.classList.toggle('has-music',has);island.classList.toggle('music-cover',!!track?.cover);island.classList.toggle('playing',!!track?.playing);
     const image=el('compact-cover');image.hidden=!track?.cover;if(track?.cover&&image.getAttribute('src')!==track.cover)image.src=track.cover;
-    const expanded=island.classList.contains('expanded'),icon=el('player-icon');
+    const expanded=window.floatHeaderExpanded===true,icon=el('player-icon');
     icon.hidden=!has||!expanded||!['qqmusic','netease'].includes(track?.source);
     if(!icon.hidden){const src='player-'+track.source+'.png';if(icon.getAttribute('src')!==src)icon.src=src;}
     image.hidden=!track?.cover||expanded;el('compact-progress').hidden=!has||expanded;
@@ -57,7 +58,7 @@
     const lines=track.lyrics?.lines||[];let index=-1;for(let i=0;i<lines.length&&lines[i].time<=position;i++)index=i;
     const status=track.lyrics?.status,now=index>=0?lines[index].text:status==='instrumental'?'纯音乐 · 静静聆听':status==='loading'?'正在匹配歌词':status==='synced'?'前奏':status==='disabled'?'歌词权限未开启':'暂无匹配的同步歌词';
     el('compact-progress').value=track.durationMs?position/track.durationMs:0;
-    if(!island.classList.contains('expanded'))el('status').textContent=now;
+    if(!window.floatHeaderChanging&&!window.floatHeaderExpanded)el('status').textContent=now;
     const next=lines[index+1]?.text||'';const key=now+'\n'+next;
     if(key!==lyricsKey){lyricsKey=key;el('lyric-now').textContent=now;el('lyric-next').textContent=next;animate(el('lyric'));}
   }

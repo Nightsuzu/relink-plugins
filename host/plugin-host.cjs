@@ -6,6 +6,8 @@ const { MAX_BYTES, PluginViolation, verifyPackage, digest, pluginSettings } = re
 const { sanitizeState, allowedAsset, actionPolicy, limiter } = require('./plugin-policy.cjs');
 const { candidates } = require('./game-catalog.cjs');
 const { PluginServices } = require('./plugin-services.cjs');
+const { PluginPointer } = require('./plugin-pointer.cjs');
+const { PluginUpdates } = require('./plugin-updates.cjs');
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'none'";
 const MIME = { html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml', png: 'image/png', webp: 'image/webp' };
 class PluginHost {
@@ -13,8 +15,10 @@ class PluginHost {
     Object.assign(this, { app, BrowserWindow, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit, listGameWindows, mediaService });
     this.root = path.join(app.getPath('userData'), 'authorized-plugins');
     this.authority = require('./plugin-authority.json');
+    this.updates = new PluginUpdates(this);
     this.records = new Map(); this.preferences = {}; this.state = sanitizeState();
     this.services = new PluginServices(this, mediaService);
+    this.pointer = new PluginPointer(point => this.pointerDown(this.screen.screenToDipPoint(point)));
     this.disposed = false; this.incident = null; this.queue = Promise.resolve(); this.gameMode = false;
     this.displayChanged = () => { for (const r of this.records.values()) if (r.window) this.position(r); };
   }
@@ -45,6 +49,8 @@ class PluginHost {
       const raw = JSON.parse(await fs.readFile(preferencesFile, 'utf8'));
       if (raw && typeof raw === 'object' && !Array.isArray(raw)) this.preferences = raw;
     } catch (error) { if (error.code !== 'ENOENT') this.preferences = {}; }
+    await this.updates.recover();
+    this.updates.start();
     // Plugins are opt-in downloads. A fresh client has no bundled plugin.
     for (const file of await fs.readdir(this.root)) {
       if (!file.endsWith('.rlplugin')) continue;
@@ -72,7 +78,8 @@ class PluginHost {
   }
   list() {
     return {
-      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], builtin: r.builtin, ...this.pref(r.manifest.id), status: r.error ? 'failed' : r.window ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
+      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, update:this.updates.state(r.manifest.id), author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], builtin: r.builtin, ...this.pref(r.manifest.id), status: r.error ? 'failed' : r.window ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
+      updates: {...this.updates.status},
       displays: this.screen.getAllDisplays().map((d, index) => ({ id: String(d.id), name: d.label || `显示器 ${index + 1}` })),
     };
   }
@@ -116,6 +123,8 @@ class PluginHost {
       try { return await fn(...args); } catch (e) { if (e instanceof PluginViolation) void this.violation(e); throw e; }
     };
     this.ipcMain.handle('relink:plugins:list', main(() => this.list()));
+    this.ipcMain.handle('relink:plugins:check-updates', main(() => this.updates.check({manual:true})));
+    this.ipcMain.handle('relink:plugins:update', main(id => this.updates.update(id)));
     this.ipcMain.handle('relink:plugins:configure', main((id, patch) => this.serialize(async () => {
       const r = this.records.get(id);
       if (!r || !patch || typeof patch !== 'object' || Object.keys(patch).some(k => !['enabled', 'displayMode', 'displayId','settings'].includes(k))) throw new Error('插件设置无效。');
@@ -124,7 +133,7 @@ class PluginHost {
       if (Object.hasOwn(patch, 'enabled')) { if (typeof patch.enabled !== 'boolean') throw new Error('插件设置无效。'); p.enabled = patch.enabled; }
       if (Object.hasOwn(patch, 'displayMode')) { if (!['always', 'voice'].includes(patch.displayMode)) throw new Error('显示方式无效。'); p.displayMode = patch.displayMode; }
       if (Object.hasOwn(patch, 'displayId')) { if (patch.displayId !== 'primary' && !this.screen.getAllDisplays().some(d => String(d.id) === patch.displayId)) throw new Error('显示器不可用。'); p.displayId = patch.displayId; }
-      if (p.enabled) { await this.check(r); if (r.manifest.apiVersion !== 1) throw new Error('此插件需要更新版本的 Relink。'); }
+      if (p.enabled) { await this.check(r); if (![1,2].includes(r.manifest.apiVersion)) throw new Error('此插件需要更新版本的 Relink。'); }
       if (p.enabled && !this.pref(id).enabled && [...this.records.keys()].filter(other => other !== id && this.pref(other).enabled).length >= 3) throw new Error('最多同时启用 3 个插件，请先关闭一个。');
       this.preferences[id] = p; r.error = null;
       await this.save(); await this.sync(r); if (r.window) {this.position(r);r.window.webContents.send('relink:plugin:settings',p.settings);} this.notify(); return this.list();
@@ -176,11 +185,28 @@ class PluginHost {
         }
       } catch (e) { if (e instanceof PluginViolation) void this.violation(e, r.manifest.id); throw e; }
     });
+    this.ipcMain.handle('relink:plugin:display-state', (event, value) => {
+      const r = plugin(event);
+      if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
+      if (!['compact','expanded','notch'].includes(value) || (value === 'notch' && !this.gameMode)) throw new Error('显示状态无效。');
+      if (!r.resizeLimit()) throw new Error('操作过于频繁。');
+      r.gameAware = true; r.displayState = value;
+      void this.resize(r, value === 'expanded');
+    });
     this.ipcMain.on('relink:plugins:shutdown-ready', (event, id) => { if (this.trustedIpc(event) && id === this.incident?.id) this.finishQuit?.(); });
   }
   presentation(r) {
     const display = this.screen.getAllDisplays().find(d => String(d.id) === this.pref(r.manifest.id).displayId) || this.screen.getPrimaryDisplay();
     return { gameMode: this.gameMode, topInset: Math.max(18, Math.min(128, display.workArea.y - display.bounds.y + 18)) };
+  }
+  pointerDown(point) {
+    for (const r of this.records.values()) {
+      if (!r.window || r.window.isDestroyed() || r.displayState !== 'expanded') continue;
+      const bounds = r.window.getBounds(), top = this.gameMode ? 0 : this.presentation(r).topInset;
+      const height = r.manifest.capabilities.includes('music.read') ? 372 : 232;
+      if (point.x >= bounds.x + (bounds.width-384)/2 && point.x < bounds.x + (bounds.width+384)/2 && point.y >= bounds.y+top && point.y < bounds.y+top+height) continue;
+      r.window.webContents.send('relink:plugin:dismiss');
+    }
   }
   async pollGames() {
     if (this.disposed || this.incident || this.pollingGames || ![...this.records.values()].some(r => r.window)) return;
@@ -203,6 +229,7 @@ class PluginHost {
       if (!r.window || r.window.isDestroyed() || !r.gameAware) continue;
       // Keep a generous canvas for the morph; shrink it after the renderer settles.
       this.cancelResize(r);
+      if (r.displayState) r.displayState = value ? 'notch' : 'compact';
       r.expanded = true; this.position(r);
       if (r.manifest.capabilities.includes('window.resize')) r.window.webContents.send('relink:plugin:presentation', this.presentation(r));
       r.resizeTimer = setTimeout(() => { r.resizeTimer = null; r.expanded = false; this.position(r); }, 600);
@@ -218,6 +245,8 @@ class PluginHost {
     // presentation/morph contract. Keep their behaviour unchanged.
     if (!r.gameAware) { r.expanded = expanded; this.position(r); return Promise.resolve(); }
     if (expanded) { r.expanded = true; this.position(r); return Promise.resolve(); }
+    // Hovering a notch needs room for the intermediate compact island too.
+    if (r.displayState === 'compact' && this.gameMode) { r.expanded = true; this.position(r); }
     // The renderer animates first, then the native canvas contracts. Rapid
     // reversal cancels this timer instead of cropping the outgoing content.
     return new Promise(resolve => {
@@ -233,11 +262,12 @@ class PluginHost {
     const pref = this.pref(r.manifest.id);
     const display = this.screen.getAllDisplays().find(d => String(d.id) === pref.displayId) || this.screen.getPrimaryDisplay();
     const gameMode = this.gameMode && r.gameAware;
+    const notch = gameMode && (!r.displayState || r.displayState === 'notch');
     const a = r.gameAware ? display.bounds : display.workArea;
     const topInset = this.presentation(r).topInset;
     // Windows clamps even a frameless native window to 38 DIP. The visible
     // notch stays 28 DIP and its input shape excludes the transparent remainder.
-    const width = Math.min(r.expanded ? 400 : gameMode ? 204 : 320, a.width), height = Math.min(r.expanded ? (r.gameAware ? (r.manifest.capabilities.includes('music.read') ? 382 : 242) + topInset : 200) : gameMode ? 38 : r.gameAware ? topInset + 70 : 74, a.height);
+    const width = Math.min(r.expanded ? 400 : notch ? 204 : 320, a.width), height = Math.min(r.expanded ? (r.gameAware ? (r.manifest.capabilities.includes('music.read') ? 382 : 242) + topInset : 200) : notch ? 38 : r.gameAware ? topInset + 70 : 74, a.height);
     // Presentation-aware windows share one screen-edge anchor. The renderer
     // spring moves the pill to/from the notch, avoiding a native 10px jump.
     const bounds = { x: Math.round(a.x + (a.width - width) / 2), y: a.y + (r.gameAware ? 0 : Math.min(10, Math.max(0, a.height - height))), width, height };
@@ -247,7 +277,7 @@ class PluginHost {
       // A game notch must accept pointer input without taking keyboard focus
       // away from the game. Normal desktop mode retains keyboard navigation.
       if (r.focusable !== !gameMode) { r.window.setFocusable(!gameMode); r.focusable = !gameMode; }
-      const shape = r.expanded ? { x:0,y:0,width,height } : { x:8,y:gameMode ? 0 : topInset,width:Math.max(1,width-16),height:gameMode ? 28 : 58 };
+      const shape = r.expanded ? { x:0,y:0,width,height } : { x:8,y:gameMode ? 0 : topInset,width:Math.max(1,width-16),height:notch ? 28 : 58 };
       r.window.setShape([shape]);
     }
   }
@@ -264,7 +294,7 @@ class PluginHost {
     let createdWindow = null;
     try {
       await this.check(r);
-      if (r.manifest.apiVersion !== 1) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
+      if (![1,2].includes(r.manifest.apiVersion)) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
       // Dedicated in-memory partition. No account session, storage or default preload is shared.
       const ses = r.session || this.session.fromPartition(`relink-plugin-${r.manifest.id}`, { cache: false });
       if (!r.session) {
@@ -280,7 +310,8 @@ class PluginHost {
         r.session = ses;
       }
       const w = new this.BrowserWindow({ width: 320, height: 74, minWidth: 0, minHeight: 0, thickFrame: false, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false, maximizable: false, minimizable: false, fullscreenable: false, skipTaskbar: true, alwaysOnTop: true, show: false, hasShadow: false, title: r.manifest.name, webPreferences: { preload: path.join(__dirname, 'plugin-preload.cjs'), session: ses, nodeIntegration: false, nodeIntegrationInWorker: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, spellcheck: false, devTools: false, backgroundThrottling: true } });
-      r.window = w; r.expanded = false; r.gameAware = false; r.focusable = true; r.limit = limiter(); r.resizeLimit = limiter(24); r.settingsLimit = limiter(30); r.overBudget = 0;
+      r.window = w; r.expanded = false; r.gameAware = false; r.displayState = null; r.focusable = true; r.limit = limiter(); r.resizeLimit = limiter(24); r.settingsLimit = limiter(30); r.overBudget = 0;
+      w.on('blur', () => { if (!this.gameMode && r.displayState === 'expanded') w.webContents.send('relink:plugin:dismiss'); });
       w.setAlwaysOnTop(true, 'screen-saver');
       w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
       createdWindow = w;
@@ -295,17 +326,17 @@ class PluginHost {
       this.position(r);
       await w.loadURL(`relink-plugin://${r.manifest.id}/${r.manifest.entry}`);
       if (this.disposed || this.incident || !this.state.authenticated || !this.pref(r.manifest.id).enabled || (this.pref(r.manifest.id).displayMode === 'voice' && !this.state.inVoice)) { this.close(r); return; }
-      w.showInactive(); this.notify();
+      w.showInactive(); this.pointer.start(); this.notify();
     } catch (error) {
       if (error instanceof PluginViolation) throw error;
       if (!this.disposed && !this.incident && this.state.authenticated && this.pref(r.manifest.id).enabled && (!createdWindow || r.window === createdWindow)) this.handleError(r, error);
     } finally { r.opening = false; }
   }
-  close(r) { if (!r) return; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); }
+  close(r) { if (!r) return; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); if (![...this.records.values()].some(item => item.window)) this.pointer.stop(); }
   release(r) {
     if (!r) return;
     this.close(r);
-    if (r.session) { r.session.protocol.unhandle('relink-plugin'); void r.session.clearStorageData().catch(() => {}); r.session = null; }
+    if (r.session) { const session = r.session; r.session = null; session.protocol.unhandle('relink-plugin'); return session.clearStorageData().catch(() => {}); }
   }
   handleError(r, error) {
     if (error instanceof PluginViolation) { void this.violation(error, r.manifest.id); return; }
@@ -314,7 +345,7 @@ class PluginHost {
   async audit() {
     if (this.disposed || this.incident || this.auditing) return; this.auditing = true;
     try {
-      await this.queue;
+      await this.serialize(async () => {
       for (const r of this.records.values()) {
         await this.check(r);
         if (r.window) {
@@ -323,6 +354,7 @@ class PluginHost {
           if (r.overBudget >= 2) this.handleError(r, new Error('插件超过内存预算。'));
         }
       }
+      });
     } catch (e) { if (e instanceof PluginViolation) void this.violation(e); }
     finally { this.auditing = false; }
   }
@@ -344,7 +376,7 @@ class PluginHost {
     const w = this.getWindow(); if (w && !w.isDestroyed()) w.webContents.send('relink:plugins:shutdown', this.incident);
   }
   dispose() {
-    this.services.stop(); this.disposed = true; clearInterval(this.auditTimer); clearInterval(this.gameTimer);
+    this.updates.stop(); this.services.stop(); this.pointer.stop(); this.disposed = true; clearInterval(this.auditTimer); clearInterval(this.gameTimer);
     this.screen.removeListener('display-removed', this.displayChanged); this.screen.removeListener('display-metrics-changed', this.displayChanged);
     for (const r of this.records.values()) this.release(r);
   }

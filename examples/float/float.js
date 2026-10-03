@@ -4,6 +4,9 @@ const card = $('island'), reduced = matchMedia('(prefers-reduced-motion: reduce)
 const presentationAware = typeof bridge.getPresentation === 'function';
 card.classList.toggle('legacy', !presentationAware);
 let expanded = false, gameMode = false, hovered = false, topInset = presentationAware ? 18 : 8, epoch = 0, lastState = {}, pending = null;
+let displayState = 'compact', headerTimer, autoViewTimer, headerAnimation, leaveTimer, hoverBlocked = false;
+let pointerPosition = null;
+window.floatHeaderExpanded = false;
 let notchTransparency=15;try{notchTransparency=Math.max(0,Math.min(85,Number(localStorage.getItem('notch-transparency') ?? 15)||0));}catch{}
 function applyPluginSettings(value){if(Number.isFinite(value.notchTransparency)){notchTransparency=value.notchTransparency;$('notch-opacity').value=String(notchTransparency);$('notch-opacity-value').textContent=notchTransparency+'%';morph();}}
 let frame = 0, previousTime = 0, started = 0, disposed = false;
@@ -34,32 +37,56 @@ function step(time) {
   else { paint(); frame = requestAnimationFrame(step); }
 }
 function morph() {
-  target = expanded ? [384,presentationAware ? (typeof bridge.getMedia === 'function' ? 372 : 232) : 184,28,gameMode ? 0 : topInset] : gameMode ? [188,28,14,0] : [304,58,29,topInset];
-  target.push(expanded ? 1 : gameMode ? 1-notchTransparency/100 : hovered ? .97 : .88);
-  target.push(expanded?28:gameMode?0:29);
+  const notch = displayState === 'notch';
+  target = expanded ? [384,presentationAware ? (typeof bridge.getMedia === 'function' ? 372 : 232) : 184,28,gameMode ? 0 : topInset] : notch ? [188,28,14,0] : [304,58,29,gameMode ? 0 : topInset];
+  target.push(expanded ? 1 : notch ? 1-notchTransparency/100 : hovered ? .97 : .88);
+  target.push(expanded?28:notch?0:29);
   started = previousTime = performance.now();
   if (reduced.matches) { cancelAnimationFrame(frame); frame = 0; settle(); }
   else if (!frame) frame = requestAnimationFrame(step);
 }
+function headerMode(mode) {
+  clearTimeout(headerTimer);
+  const header = $('header'), opacity = Number(getComputedStyle(header).opacity);
+  headerAnimation?.cancel(); window.floatHeaderChanging = true;
+  const update = () => {
+    card.classList.toggle('notch', mode === 'notch');
+    card.classList.toggle('header-expanded', mode === 'expanded');
+    header.style.width = (mode === 'notch' ? 186 : mode === 'expanded' ? 382 : 302) + 'px';
+    window.floatHeaderExpanded = mode === 'expanded'; window.floatHeaderChanging = false;
+    window.floatRefreshSummary?.();
+    headerAnimation?.cancel();
+    if (!reduced.matches) headerAnimation = header.animate([{opacity:0},{opacity:1}], {duration:180,delay:70,fill:'both',easing:'ease-out'});
+  };
+  if (reduced.matches) update();
+  else { headerAnimation = header.animate([{opacity},{opacity:0}], {duration:80,fill:'forwards',easing:'ease-out'}); headerTimer = setTimeout(update,80); }
+}
 function semantic(next) {
-  expanded = next; if(!next)window.floatAutoView?.(); card.classList.toggle('expanded', next);
-  window.floatRefreshSummary?.();
+  expanded = next; card.classList.toggle('expanded', next);
+  clearTimeout(autoViewTimer);
+  if(!next) autoViewTimer = setTimeout(() => window.floatAutoView?.(), reduced.matches ? 0 : 160);
   $('summary').setAttribute('aria-expanded', String(next));
   $('summary').setAttribute('aria-label', next ? '收起浮岛' : '展开浮岛');
   $('details').inert = !next; $('details').setAttribute('aria-hidden', String(!next));
   if (!next && $('details').contains(document.activeElement)) $('summary').focus({ preventScroll: true });
 }
 async function setExpanded(next) {
-  if (next === expanded) return;
+  return setDisplayState(next ? 'expanded' : gameMode ? 'notch' : 'compact');
+}
+async function setDisplayState(next) {
+  if (next === displayState) return;
+  clearTimeout(leaveTimer);
   const generation = ++epoch;
-  semantic(next);
-  if (!next) morph();
+  const opening = next === 'expanded' || (displayState === 'notch' && next === 'compact');
+  displayState = next; semantic(next === 'expanded'); headerMode(next);
+  if (!opening) morph();
   try {
-    await bridge.action(next ? 'expand' : 'collapse');
-    if (generation === epoch && next) morph();
+    if (bridge.setDisplayState) await bridge.setDisplayState(next);
+    else await bridge.action(next === 'expanded' || (gameMode && next === 'compact') ? 'expand' : 'collapse');
+    if (generation === epoch && opening) morph();
   } catch {
     if (generation !== epoch) return;
-    semantic(false); morph(); $('notice').textContent = '请返回 Relink 继续操作。';
+    displayState = gameMode ? 'notch' : 'compact'; semantic(false); headerMode(displayState); morph(); $('notice').textContent = '请返回 Relink 继续操作。';
   }
 }
 function clearPending() { if (pending) clearTimeout(pending.timer); pending = null; }
@@ -74,14 +101,14 @@ async function action(name) {
   try { await bridge.action(name); if (name === 'show') void setExpanded(false); }
   catch { clearPending(); render(lastState); $('notice').textContent = '暂时无法操作，请返回通话。'; }
 }
-let changeAnimation;
 function render(state) {
   const old = lastState; lastState = state;
   if (pending && (state[pending.key] === pending.expected || !state.connected || !state.inVoice)) clearPending();
   const status = !state.connected ? '连接中断' : state.deafened ? '耳机已关闭' : state.muted ? '麦克风已静音' : state.sharing ? '正在共享屏幕' : state.inVoice ? '通话中' : '在线 · 尚未加入通话';
-  const changed = $('status').textContent !== status;
-  $('room').textContent = state.inVoice ? state.roomName || '语音频道' : 'Relink';
-  $('status').textContent = status;
+  if (!window.floatHasMusic && !window.floatHeaderChanging) {
+    $('room').textContent = state.inVoice ? state.roomName || '语音频道' : 'Relink';
+    $('status').textContent = status;
+  }
   $('count').textContent = state.inVoice ? `${state.memberCount} 人在通话` : '加入频道后可使用通话控制';
   $('share').hidden = !state.sharing || !state.connected;
   for (const [id, flag] of [['mute',state.muted],['quick-mute',state.muted],['deafen',state.deafened]]) {
@@ -92,10 +119,6 @@ function render(state) {
   $('deafen').setAttribute('aria-label', state.deafened ? '开启耳机' : '关闭耳机');
   $('mute-label').textContent = state.muted ? '取消静音' : '麦克风';
   $('deafen-label').textContent = state.deafened ? '开启耳机' : '耳机';
-  if (changed && !reduced.matches) {
-    changeAnimation?.cancel();
-    changeAnimation = card.querySelector('.copy').animate([{ opacity:.45,transform:'translateY(2px)' },{ opacity:1,transform:'translateY(0)' }], { duration:240,easing:'ease-out' });
-  }
   window.floatRefreshSummary?.();
   if (old.inVoice && !state.inVoice && !window.floatHasMusic) void setExpanded(false);
 }
@@ -104,6 +127,8 @@ function presentation(value) {
   if (gameMode === (value.gameMode === true) && topInset === inset) return;
   topInset = inset;
   gameMode = value.gameMode === true; ++epoch;
+  clearTimeout(leaveTimer); hovered = false; hoverBlocked = false;
+  displayState = gameMode ? 'notch' : 'compact'; headerMode(displayState);
   semantic(false); card.classList.toggle('game', gameMode);
   $('mode').textContent = gameMode ? '游戏模式 · 贴顶收起' : '通话随身，桌面留白';
   morph();
@@ -113,18 +138,31 @@ $('collapse').addEventListener('click', () => void setExpanded(false));
 $('quick-mute').addEventListener('click', () => void action('mute'));
 for (const id of ['mute','deafen','show']) $(id).addEventListener('click', () => void action(id));
 document.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); void setExpanded(false); } });
-// Leaving starts one cancellable 3-second contraction in every presentation mode.
-let leaveTimer;
-card.addEventListener('pointerleave', () => { hovered = false; morph(); if (expanded) leaveTimer = setTimeout(() => void setExpanded(false), 3000); });
-card.addEventListener('pointerenter', () => { hovered = true; clearTimeout(leaveTimer); if(gameMode&&!expanded)void setExpanded(true);else morph(); });
+// Hover reveals only the compact island. Outside clicks dismiss immediately;
+// the three-second grace period applies only to leaving without clicking.
+function dismiss() { clearTimeout(leaveTimer); hoverBlocked = true; void setExpanded(false); }
+card.addEventListener('pointerleave', () => { hovered = false; morph(); if (expanded || (gameMode && displayState === 'compact')) leaveTimer = setTimeout(() => void setExpanded(false), 3000); });
+card.addEventListener('pointerenter', () => { hovered = true; clearTimeout(leaveTimer); if(gameMode && displayState === 'notch' && !hoverBlocked) void setDisplayState('compact'); else morph(); });
+card.addEventListener('pointermove', event => {
+  const position = `${event.screenX},${event.screenY}`;
+  // Native canvas contraction can synthesize leave/enter without moving the
+  // pointer. Only fresh pointer movement rearms hover after an outside click.
+  if (hoverBlocked && pointerPosition !== null && position !== pointerPosition) {
+    hoverBlocked = false;
+    if (gameMode && displayState === 'notch') void setDisplayState('compact');
+  }
+  pointerPosition = position;
+});
+document.addEventListener('pointerdown', event => { if (expanded && !card.contains(event.target)) dismiss(); });
+const offDismiss = bridge.onDismiss?.(dismiss);
 $('notch-opacity').value=String(notchTransparency);$('notch-opacity-value').textContent=notchTransparency+'%';
 $('notch-opacity').addEventListener('input',()=>{notchTransparency=Number($('notch-opacity').value);$('notch-opacity-value').textContent=notchTransparency+'%';morph();});
 $('notch-opacity').addEventListener('change',()=>{if(bridge.updateSettings)void bridge.updateSettings({notchTransparency}).catch(()=>{$('notice').textContent='设置未保存，请稍后重试';});else try{localStorage.setItem('notch-transparency',String(notchTransparency));}catch{}});
-function motionPreferenceChanged() { if (reduced.matches) changeAnimation?.cancel(); morph(); }
+function motionPreferenceChanged() { if (reduced.matches) headerMode(displayState); morph(); }
 reduced.addEventListener('change', motionPreferenceChanged);
 const offState = bridge.onState(render), offPresentation = bridge.onPresentation?.(presentation);
 const offSettings=bridge.onSettings?.(applyPluginSettings);bridge.getSettings?.().then(applyPluginSettings).catch(()=>{});
 paint();
 bridge.getState().then(render).catch(() => render(lastState));
 bridge.getPresentation?.().then(presentation).catch(() => {});
-window.addEventListener('pagehide', () => { disposed = true; cancelAnimationFrame(frame); clearTimeout(leaveTimer); clearPending(); changeAnimation?.cancel(); offState(); offPresentation?.(); offSettings?.(); reduced.removeEventListener('change', motionPreferenceChanged); }, { once:true });
+window.addEventListener('pagehide', () => { disposed = true; cancelAnimationFrame(frame); clearTimeout(leaveTimer); clearTimeout(headerTimer); clearTimeout(autoViewTimer); headerAnimation?.cancel(); clearPending(); offState(); offPresentation?.(); offSettings?.(); offDismiss?.(); reduced.removeEventListener('change', motionPreferenceChanged); }, { once:true });
