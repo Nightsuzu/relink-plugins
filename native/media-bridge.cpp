@@ -79,11 +79,11 @@ JsonArray players(){
 constexpr UINT PointerDownMessage = WM_APP + 1;
 bool cursorInteractive(HWND foreground) {
  CURSORINFO info{};info.cbSize=sizeof(info);RECT clip{};
- GUITHREADINFO gui{};gui.cbSize=sizeof(gui);
- const auto thread=foreground?GetWindowThreadProcessId(foreground,nullptr):0;
- if(!thread||!GetGUIThreadInfo(thread,&gui)||gui.hwndCapture||!GetCursorInfo(&info)||!GetClipCursor(&clip))return false;
- return info.hCursor && (info.flags&CURSOR_SHOWING)!=0 && (info.flags&CURSOR_SUPPRESSED)==0
-  && clip.right-clip.left>4 && clip.bottom-clip.top>4;
+ // Capture routes button/drag input; it does not mean that the game hid its
+ // cursor. Visible game menus and Chromium buttons can legitimately capture.
+ if(!foreground||!GetCursorInfo(&info)||!GetClipCursor(&clip))return false;
+ return cursorReleased(info.hCursor!=nullptr,(info.flags&CURSOR_SHOWING)!=0,
+  (info.flags&CURSOR_SUPPRESSED)!=0,clip.right-clip.left,clip.bottom-clip.top);
 }
 LRESULT CALLBACK pointerHook(int code, WPARAM message, LPARAM data) {
  if(code>=0 && (message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN||message==WM_XBUTTONDOWN)) {

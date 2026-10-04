@@ -1,8 +1,13 @@
 #pragma once
 #include <cstdint>
 
+// Mouse capture is independent of cursor visibility and may remain active in
+// a game menu. A hidden/suppressed cursor or a tiny camera lock blocks input.
+inline bool cursorReleased(bool handle, bool showing, bool suppressed, long width, long height) {
+ return handle && showing && !suppressed && width > 4 && height > 4;
+}
 // A transient visible cursor is not enough to release game input. Require a
-// stable visible, uncaptured cursor on the same foreground window. Blocking
+// stable visible cursor on the same foreground window. Blocking
 // is immediate; only enabling interaction is delayed.
 struct CursorReleaseGate {
  bool pending = false;
