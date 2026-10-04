@@ -88,7 +88,7 @@ class PluginHost {
   }
   list() {
     return {
-      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, update:this.updates.state(r.manifest.id), author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], builtin: r.builtin, ...this.pref(r.manifest.id), status: r.error ? 'failed' : r.window ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
+      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, update:this.updates.state(r.manifest.id), author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], builtin: r.builtin, ...this.pref(r.manifest.id), status: r.recovering ? 'recovering' : r.error ? 'failed' : r.window ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
       updates: {...this.updates.status},
       displays: this.screen.getAllDisplays().map((d, index) => ({ id: String(d.id), name: d.label || `显示器 ${index + 1}` })),
     };
@@ -182,6 +182,7 @@ class PluginHost {
       if (p.enabled) { await this.check(r); if (![1,2].includes(r.manifest.apiVersion)) throw new Error('此插件需要更新版本的 Relink。'); }
       if (p.enabled && !this.pref(id).enabled && [...this.records.keys()].filter(other => other !== id && this.pref(other).enabled).length >= 3) throw new Error('最多同时启用 3 个插件，请先关闭一个。');
       this.preferences[id] = p; r.error = null;
+      if (Object.hasOwn(patch, 'enabled')) { this.cancelRecovery(r); r.runtimeFailures = []; }
       await this.save(); await this.sync(r); if (r.window) {this.position(r);r.window.webContents.send('relink:plugin:settings',p.settings);if(r.gameAware)r.window.webContents.send('relink:plugin:presentation',this.presentation(r));} this.notify(); return this.list();
     })));
     this.ipcMain.handle('relink:plugins:install-file', main(file => this.installFile(file)));
@@ -405,8 +406,9 @@ class PluginHost {
   }
   async sync(r) {
     const show = !r.removed && !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);
-    if (!show || r.error) { this.close(r); return; }
-    if (r.window || r.opening) return;
+    if (!show) { this.close(r); return; }
+    if (r.error) return;
+    if (r.window || r.opening || r.recovering) return;
     if ([...this.records.values()].filter(item => item.window || item.opening).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
     r.opening = true;
     let createdWindow = null;
@@ -440,8 +442,7 @@ class PluginHost {
       wc.on('will-navigate', event => event.preventDefault());
       wc.on('will-frame-navigate', event => event.preventDefault());
       wc.on('will-attach-webview', event => event.preventDefault());
-      wc.on('render-process-gone', () => { if (r.window === w && !this.disposed && !this.incident) this.handleError(r, new Error('插件已暂停，主通话保持运行。')); });
-      wc.on('unresponsive', () => this.handleError(r, new Error('插件响应超时，已暂停。')));
+      this.watchWindow(r, w);
       w.once('closed', () => { if (r.window === w) r.window = null; });
       this.position(r);
       await w.loadURL(`relink-plugin://${r.manifest.id}/${r.manifest.entry}`);
@@ -453,15 +454,59 @@ class PluginHost {
       if (!this.disposed && !this.incident && this.state.authenticated && this.pref(r.manifest.id).enabled && (!createdWindow || r.window === createdWindow)) this.handleError(r, error);
     } finally { r.opening = false; if (r.removed) await this.release(r); }
   }
-  close(r) { if (!r) return; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); if (![...this.records.values()].some(item => item.window)) this.pointer.stop(); }
+  cancelRecovery(r) { clearTimeout(r.recoveryTimer); r.recoveryTimer = null; r.recovering = false; }
+  watchWindow(r, w) {
+    const owns = () => r.window === w && !r.removed && !this.disposed && !this.incident;
+    w.webContents.on('render-process-gone', (_event, details) => {
+      if (owns()) this.handleError(r, new Error('插件进程中断。'), details?.reason === 'oom' ? 'memory' : 'crash');
+    });
+    w.webContents.on('unresponsive', () => {
+      if (!owns() || r.unresponsiveTimer) return;
+      // GPU contention / a focus stall can recover by itself. Do not destroy
+      // the window at the first transient Chromium notification.
+      r.unresponsiveTimer = setTimeout(() => {
+        r.unresponsiveTimer = null;
+        if (owns()) this.handleError(r, new Error('插件持续未响应。'), 'unresponsive');
+      }, 6000);
+      r.unresponsiveTimer.unref?.();
+    });
+    w.webContents.on('responsive', () => { if (owns()) { clearTimeout(r.unresponsiveTimer); r.unresponsiveTimer = null; } });
+  }
+  close(r) { if (!r) return; this.cancelRecovery(r); clearTimeout(r.unresponsiveTimer); r.unresponsiveTimer = null; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); if (![...this.records.values()].some(item => item.window)) this.pointer.stop(); }
   release(r) {
     if (!r) return;
     this.close(r);
     if (r.session) { const session = r.session; r.session = null; session.protocol.unhandle('relink-plugin'); return session.clearStorageData().catch(() => {}); }
   }
-  handleError(r, error) {
+  handleError(r, error, cause = 'runtime') {
     if (error instanceof PluginViolation) { void this.violation(error, r.manifest.id); return; }
-    r.error = '插件已暂停，请关闭后重新启用。'; this.close(r); this.notify();
+    if (r.removed || this.disposed || this.incident) return;
+    // A single bounded record explains a later failure without recording
+    // account/session data, music metadata or arbitrary exception strings.
+    const metric = r.window && this.app.getAppMetrics?.().find(m => m.pid === r.window.webContents.getOSProcessId());
+    const memory = metric?.memory;
+    const diagnostic = { at:new Date().toISOString(),pluginId:r.manifest.id,version:r.manifest.version,cause,
+      ...(memory ? { workingSetKB:memory.workingSetSize,privateKB:memory.privateBytes } : {}) };
+    void fs.writeFile(path.join(this.root, 'last-runtime-failure.json'), JSON.stringify(diagnostic)).catch(() => {});
+    const now = Date.now();
+    r.runtimeFailures = (r.runtimeFailures || []).filter(at => now - at < 300000);
+    const recover = cause !== 'memory' && r.runtimeFailures.length < 2 && this.state.authenticated && this.pref(r.manifest.id).enabled;
+    r.runtimeFailures.push(now);
+    this.close(r);
+    r.error = cause === 'memory' ? '插件持续超过内存限额，已暂停。' : '插件连续运行异常，已暂停。请关闭后重新启用。';
+    if (recover) {
+      r.error = null; r.recovering = true;
+      const resume = () => {
+        r.recoveryTimer = null;
+        if (this.records.get(r.manifest.id) !== r || r.removed || this.disposed || this.incident || !this.state.authenticated || !this.pref(r.manifest.id).enabled) { r.recovering = false; return; }
+        if (r.opening) { r.recoveryTimer = setTimeout(resume, 250); r.recoveryTimer.unref?.(); return; }
+        r.recovering = false;
+        void this.sync(r).catch(e => this.handleError(r, e));
+      };
+      r.recoveryTimer = setTimeout(resume, 1000 * r.runtimeFailures.length);
+      r.recoveryTimer.unref?.();
+    }
+    this.notify();
   }
   async audit() {
     if (this.disposed || this.incident || this.auditing) return; this.auditing = true;
@@ -471,8 +516,11 @@ class PluginHost {
         await this.check(r);
         if (r.window) {
           const metric = this.app.getAppMetrics().find(m => m.pid === r.window.webContents.getOSProcessId());
-          r.overBudget = metric?.memory?.workingSetSize > 196608 ? (r.overBudget || 0) + 1 : 0;
-          if (r.overBudget >= 2) this.handleError(r, new Error('插件超过内存预算。'));
+          // Windows working sets include Chromium's shared pages. Apply the
+          // same 192 MiB cap to the renderer's private allocation instead.
+          const bytes = Number.isFinite(metric?.memory?.privateBytes) ? metric.memory.privateBytes : metric?.memory?.workingSetSize;
+          r.overBudget = bytes > 196608 ? (r.overBudget || 0) + 1 : 0;
+          if (r.overBudget >= 2) this.handleError(r, new Error('插件超过内存预算。'), 'memory');
         }
       }
       });
