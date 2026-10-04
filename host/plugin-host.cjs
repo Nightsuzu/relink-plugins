@@ -21,7 +21,13 @@ class PluginHost {
     this.cursorInteractive = false;
     this.pointer = new PluginPointer(point => this.pointerDown(this.screen.screenToDipPoint(point)), value => this.setCursorInteractive(value));
     this.disposed = false; this.incident = null; this.queue = Promise.resolve(); this.gameMode = false;
-    this.displayChanged = () => { for (const r of this.records.values()) if (r.window) this.position(r); };
+    this.displayChanged = () => {
+      for (const r of this.records.values()) if (r.window && !r.window.isDestroyed()) {
+        this.position(r);
+        if (r.gameAware) r.window.webContents.send('relink:plugin:presentation', this.presentation(r));
+      }
+      this.notify();
+    };
   }
   async readPackage(file) {
     const stat = await fs.lstat(file);
@@ -64,6 +70,9 @@ class PluginHost {
       this.records.set(item.manifest.id, { ...item, file: full, builtin: false, window: null, error: null });
     }
     this.register();
+    this.mainWindow = this.getWindow();
+    this.mainWindow?.on?.('move', this.displayChanged);
+    this.screen.on('display-added', this.displayChanged);
     this.screen.on('display-removed', this.displayChanged);
     this.screen.on('display-metrics-changed', this.displayChanged);
     this.auditTimer = setInterval(() => void this.audit(), 10000); this.auditTimer.unref();
@@ -75,7 +84,7 @@ class PluginHost {
   }
   pref(id) {
     const value = this.preferences[id] || {};
-    return { enabled: value.enabled === true, displayMode: value.displayMode === 'voice' ? 'voice' : 'always', displayId: typeof value.displayId === 'string' ? value.displayId : 'primary',settings:pluginSettings(this.records.get(id)?.manifest||{},value.settings) };
+    return { enabled: value.enabled === true, displayMode: value.displayMode === 'voice' ? 'voice' : 'always', displayId: typeof value.displayId === 'string' ? value.displayId : 'auto',settings:pluginSettings(this.records.get(id)?.manifest||{},value.settings) };
   }
   list() {
     return {
@@ -117,6 +126,41 @@ class PluginHost {
       return this.list();
     });
   }
+  async uninstall(id) {
+    return this.serialize(async () => {
+      if (this.disposed || this.incident) throw new Error('插件模块已停止。');
+      const r = typeof id === 'string' ? this.records.get(id) : null;
+      if (!r || r.builtin) throw new Error('此插件不可卸载。');
+      const file = path.join(this.root, `${id}.rlplugin`);
+      if (!/^[a-z][a-z0-9-]{2,63}$/.test(id) || path.resolve(r.file) !== path.resolve(file)) throw new Error('插件安装位置无效。');
+      const options = { type:'question',title:'卸载插件',message:`卸载「${r.manifest.name}」？`,detail:'将关闭此插件，并删除插件及其设置。Relink 和正在进行的通话不受影响。',buttons:['卸载插件','取消'],defaultId:1,cancelId:1,noLink:true };
+      const main = this.getWindow();
+      const answer = main && !main.isDestroyed() ? await this.dialog.showMessageBox(main, options) : await this.dialog.showMessageBox(options);
+      if (answer.response !== 0 || this.disposed || this.incident) return this.list();
+      const previous = this.preferences[id];
+      r.removed = true;
+      delete this.preferences[id];
+      try {
+        // Persist removal of the enabled flag first. An interrupted uninstall
+        // can leave a disabled package, but cannot relaunch it on next startup.
+        await this.save();
+        await this.release(r);
+        for (const suffix of ['.pending.json','.previous','.update','.tmp','']) {
+          await fs.unlink(file + suffix).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        }
+      } catch (error) {
+        r.removed = false;
+        if (previous === undefined) delete this.preferences[id]; else this.preferences[id] = previous;
+        await this.save();
+        await this.sync(r);
+        throw error;
+      }
+      this.records.delete(id);
+      this.updates.available.delete(id);
+      this.notify();
+      return this.list();
+    });
+  }
   register() {
     const main = (fn) => async (event, ...args) => {
       if (!this.trustedIpc(event)) throw new Error('来源不允许。');
@@ -126,6 +170,7 @@ class PluginHost {
     this.ipcMain.handle('relink:plugins:list', main(() => this.list()));
     this.ipcMain.handle('relink:plugins:check-updates', main(() => this.updates.check({manual:true})));
     this.ipcMain.handle('relink:plugins:update', main(id => this.updates.update(id)));
+    this.ipcMain.handle('relink:plugins:uninstall', main(id => this.uninstall(id)));
     this.ipcMain.handle('relink:plugins:configure', main((id, patch) => this.serialize(async () => {
       const r = this.records.get(id);
       if (!r || !patch || typeof patch !== 'object' || Object.keys(patch).some(k => !['enabled', 'displayMode', 'displayId','settings'].includes(k))) throw new Error('插件设置无效。');
@@ -133,11 +178,11 @@ class PluginHost {
       if(Object.hasOwn(patch,'settings'))p.settings=pluginSettings(r.manifest,p.settings,patch.settings);
       if (Object.hasOwn(patch, 'enabled')) { if (typeof patch.enabled !== 'boolean') throw new Error('插件设置无效。'); p.enabled = patch.enabled; }
       if (Object.hasOwn(patch, 'displayMode')) { if (!['always', 'voice'].includes(patch.displayMode)) throw new Error('显示方式无效。'); p.displayMode = patch.displayMode; }
-      if (Object.hasOwn(patch, 'displayId')) { if (patch.displayId !== 'primary' && !this.screen.getAllDisplays().some(d => String(d.id) === patch.displayId)) throw new Error('显示器不可用。'); p.displayId = patch.displayId; }
+      if (Object.hasOwn(patch, 'displayId')) { if (!['primary','auto'].includes(patch.displayId) && !this.screen.getAllDisplays().some(d => String(d.id) === patch.displayId)) throw new Error('显示器不可用。'); p.displayId = patch.displayId; }
       if (p.enabled) { await this.check(r); if (![1,2].includes(r.manifest.apiVersion)) throw new Error('此插件需要更新版本的 Relink。'); }
       if (p.enabled && !this.pref(id).enabled && [...this.records.keys()].filter(other => other !== id && this.pref(other).enabled).length >= 3) throw new Error('最多同时启用 3 个插件，请先关闭一个。');
       this.preferences[id] = p; r.error = null;
-      await this.save(); await this.sync(r); if (r.window) {this.position(r);r.window.webContents.send('relink:plugin:settings',p.settings);} this.notify(); return this.list();
+      await this.save(); await this.sync(r); if (r.window) {this.position(r);r.window.webContents.send('relink:plugin:settings',p.settings);if(r.gameAware)r.window.webContents.send('relink:plugin:presentation',this.presentation(r));} this.notify(); return this.list();
     })));
     this.ipcMain.handle('relink:plugins:install-file', main(file => this.installFile(file)));
     this.ipcMain.handle('relink:plugins:install', main(async () => {
@@ -186,19 +231,40 @@ class PluginHost {
         }
       } catch (e) { if (e instanceof PluginViolation) void this.violation(e, r.manifest.id); throw e; }
     });
-    this.ipcMain.handle('relink:plugin:display-state', (event, value) => {
+    this.ipcMain.handle('relink:plugin:display-state', (event, value, transition) => {
       const r = plugin(event);
       if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
       if (!['compact','expanded','notch'].includes(value) || (value === 'notch' && !this.gameMode)) throw new Error('显示状态无效。');
+      if (transition !== undefined && (!Number.isSafeInteger(transition) || transition < 1)) throw new Error('动画标识无效。');
       if (this.gameMode && !this.cursorInteractive && value !== 'notch') throw new Error('游戏正在使用鼠标。');
       if (!r.resizeLimit()) throw new Error('操作过于频繁。');
       r.gameAware = true; r.displayState = value;
-      void this.resize(r, value === 'expanded');
+      void this.resize(r, value === 'expanded', transition);
+    });
+    this.ipcMain.handle('relink:plugin:display-settled', (event, transition) => {
+      const r = plugin(event);
+      if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
+      if (!Number.isSafeInteger(transition) || transition < 1) throw new Error('动画标识无效。');
+      if (r.transition !== transition) return;
+      this.cancelResize(r);
+      r.expanded = r.displayState === 'expanded';
+      this.position(r);
     });
     this.ipcMain.on('relink:plugins:shutdown-ready', (event, id) => { if (this.trustedIpc(event) && id === this.incident?.id) this.finishQuit?.(); });
   }
+  targetDisplay(r) {
+    const id = this.pref(r.manifest.id).displayId, displays = this.screen.getAllDisplays();
+    if (id === 'primary') return this.screen.getPrimaryDisplay();
+    const chosen = displays.find(d => String(d.id) === id);
+    if (chosen) return chosen;
+    const game = this.gameMode && displays.find(d => String(d.id) === this.gameDisplayId);
+    if (game) return game;
+    const main = this.getWindow();
+    return main && !main.isDestroyed() && main.getBounds && this.screen.getDisplayMatching
+      ? this.screen.getDisplayMatching(main.getBounds()) : this.screen.getPrimaryDisplay();
+  }
   presentation(r) {
-    const display = this.screen.getAllDisplays().find(d => String(d.id) === this.pref(r.manifest.id).displayId) || this.screen.getPrimaryDisplay();
+    const display = this.targetDisplay(r);
     return { gameMode: this.gameMode, hoverAllowed: !this.gameMode || this.cursorInteractive, topInset: Math.max(18, Math.min(128, display.workArea.y - display.bounds.y + 18)) };
   }
   setCursorInteractive(value) {
@@ -232,8 +298,21 @@ class PluginHost {
       if (this.disposed || this.incident) return;
       // A launched known game keeps the notch compact even during Alt+Tab.
       const active = rows.some(r => r.known);
+      const game = rows.find(r => r.known && r.foreground) || rows.find(r => r.known && `${r.pid}:${r.created}` === this.gameIdentity) || rows.find(r => r.known);
+      let displayId = this.gameDisplayId;
+      if (game) {
+        this.gameIdentity = `${game.pid}:${game.created}`;
+        const b = game.bounds;
+        if (b && ['x','y','width','height'].every(k => Number.isFinite(b[k]) && Math.abs(b[k]) <= 65536) && b.width > 0 && b.height > 0) {
+          const point = this.screen.screenToDipPoint({x:Math.round(b.x+b.width/2),y:Math.round(b.y+b.height/2)});
+          displayId = String(this.screen.getDisplayNearestPoint(point).id);
+        }
+      }
       this.gameMisses = active ? 0 : (this.gameMisses || 0) + 1;
+      if (!active && this.gameMisses >= 2) { displayId = undefined; this.gameIdentity = null; }
+      const moved = displayId !== this.gameDisplayId; this.gameDisplayId = displayId;
       if (active || this.gameMisses >= 2) this.setGameMode(active);
+      if (moved) this.displayChanged();
       for (const r of this.records.values()) if (r.window && !r.window.isDestroyed()) r.window.setAlwaysOnTop(true, 'screen-saver');
     } catch { /* A failed native probe is not evidence that the game closed. */ }
     finally { this.pollingGames = false; }
@@ -254,16 +333,31 @@ class PluginHost {
   cancelResize(r) {
     clearTimeout(r.resizeTimer); r.resizeTimer = null;
     r.resizeResolve?.(); r.resizeResolve = null;
+    r.transition = null;
+    if (r.unthrottled && r.window && !r.window.isDestroyed()) r.window.webContents.setBackgroundThrottling(true);
+    r.unthrottled = false;
   }
-  resize(r, expanded) {
+  resize(r, expanded, transition) {
     if (expanded && this.gameMode && !this.cursorInteractive) return Promise.reject(new Error('游戏正在使用鼠标。'));
     this.cancelResize(r);
     // Older API-v1 plugins expect immediate resize and do not opt into the
     // presentation/morph contract. Keep their behaviour unchanged.
     if (!r.gameAware) { r.expanded = expanded; this.position(r); return Promise.resolve(); }
+    if (transition !== undefined) {
+      // Keep rendering through focus loss, then restore idle throttling after
+      // the plugin's final painted frame. The deadline bounds crashed plugins.
+      r.transition = transition; r.expanded = true;
+      r.window.webContents.setBackgroundThrottling(false); r.unthrottled = true;
+      this.position(r);
+      r.resizeTimer = setTimeout(() => {
+        this.cancelResize(r); r.expanded = r.displayState === 'expanded'; this.position(r);
+      }, 1800);
+      return Promise.resolve();
+    }
     if (expanded) { r.expanded = true; this.position(r); return Promise.resolve(); }
-    // Hovering a notch needs room for the intermediate compact island too.
-    if (r.displayState === 'compact' && this.gameMode) { r.expanded = true; this.position(r); }
+    // Keep the outgoing shape drawable, including compact -> notch when a
+    // game hides its cursor. Input is already click-through in that case.
+    r.expanded = true; this.position(r);
     // The renderer animates first, then the native canvas contracts. Rapid
     // reversal cancels this timer instead of cropping the outgoing content.
     return new Promise(resolve => {
@@ -276,8 +370,7 @@ class PluginHost {
   }
   position(r) {
     if (!r.window || r.window.isDestroyed()) return;
-    const pref = this.pref(r.manifest.id);
-    const display = this.screen.getAllDisplays().find(d => String(d.id) === pref.displayId) || this.screen.getPrimaryDisplay();
+    const display = this.targetDisplay(r);
     const gameMode = this.gameMode && r.gameAware;
     const notch = gameMode && (!r.displayState || r.displayState === 'notch');
     const a = r.gameAware ? display.bounds : display.workArea;
@@ -311,7 +404,7 @@ class PluginHost {
     if (current.packageHash !== r.packageHash) { const error = new PluginViolation('package-changed'); error.managedFile = r.file; throw error; }
   }
   async sync(r) {
-    const show = !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);
+    const show = !r.removed && !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);
     if (!show || r.error) { this.close(r); return; }
     if (r.window || r.opening) return;
     if ([...this.records.values()].filter(item => item.window || item.opening).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
@@ -319,6 +412,7 @@ class PluginHost {
     let createdWindow = null;
     try {
       await this.check(r);
+      if (r.removed) return;
       if (![1,2].includes(r.manifest.apiVersion)) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
       // Dedicated in-memory partition. No account session, storage or default preload is shared.
       const ses = r.session || this.session.fromPartition(`relink-plugin-${r.manifest.id}`, { cache: false });
@@ -328,6 +422,7 @@ class PluginHost {
         if (!name || request.method !== 'GET') return new Response('', { status: 403 });
         return new Response(r.assets.get(name), { headers: { 'Content-Type': MIME[name.split('.').pop()], 'Content-Security-Policy': CSP, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
         });
+        if (r.removed) { ses.protocol.unhandle('relink-plugin'); return; }
         ses.setPermissionCheckHandler(() => false); ses.setPermissionRequestHandler((_wc, _p, callback) => callback(false));
         ses.setDevicePermissionHandler(() => false);
         ses.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !allowedAsset(details.url, r.manifest.id, r.assets) }));
@@ -350,12 +445,13 @@ class PluginHost {
       w.once('closed', () => { if (r.window === w) r.window = null; });
       this.position(r);
       await w.loadURL(`relink-plugin://${r.manifest.id}/${r.manifest.entry}`);
-      if (this.disposed || this.incident || !this.state.authenticated || !this.pref(r.manifest.id).enabled || (this.pref(r.manifest.id).displayMode === 'voice' && !this.state.inVoice)) { this.close(r); return; }
+      if (r.removed || this.disposed || this.incident || !this.state.authenticated || !this.pref(r.manifest.id).enabled || (this.pref(r.manifest.id).displayMode === 'voice' && !this.state.inVoice)) { this.close(r); return; }
       w.showInactive(); this.pointer.start(); this.notify();
     } catch (error) {
+      if (r.removed) return;
       if (error instanceof PluginViolation) throw error;
       if (!this.disposed && !this.incident && this.state.authenticated && this.pref(r.manifest.id).enabled && (!createdWindow || r.window === createdWindow)) this.handleError(r, error);
-    } finally { r.opening = false; }
+    } finally { r.opening = false; if (r.removed) await this.release(r); }
   }
   close(r) { if (!r) return; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); if (![...this.records.values()].some(item => item.window)) this.pointer.stop(); }
   release(r) {
@@ -402,6 +498,8 @@ class PluginHost {
   }
   dispose() {
     this.updates.stop(); this.services.stop(); this.pointer.stop(); this.disposed = true; clearInterval(this.auditTimer); clearInterval(this.gameTimer);
+    this.mainWindow?.removeListener?.('move', this.displayChanged);
+    this.screen.removeListener('display-added', this.displayChanged);
     this.screen.removeListener('display-removed', this.displayChanged); this.screen.removeListener('display-metrics-changed', this.displayChanged);
     for (const r of this.records.values()) this.release(r);
   }

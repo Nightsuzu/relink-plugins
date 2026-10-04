@@ -1,7 +1,7 @@
 {
   "id": "relink-float",
   "name": "Relink 浮岛",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "apiVersion": 2,
   "entry": "index.html",
   "description": "黑白浮岛：音乐封面、同步歌词、播放控制、通话与频道切换，游戏时自动贴顶。",

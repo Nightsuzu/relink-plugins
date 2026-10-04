@@ -19,7 +19,9 @@ export interface PluginBridge {
   onState(callback: (state: PluginState) => void): () => void;
   action(action: PluginAction): Promise<void>;
   /** window.resize; three-stage overlay. Notch is available in game mode only. */
-  setDisplayState?(state:'notch'|'compact'|'expanded'):Promise<void>;
+  setDisplayState?(state:'notch'|'compact'|'expanded', transition?:number):Promise<void>;
+  /** Optional on older hosts. Finish the matching transition after its final frame; restores idle throttling. */
+  completeDisplayTransition?(transition:number):Promise<void>;
   /** Host-filtered outside click/focus loss. Does not expose global input data. */
   onDismiss?(callback:()=>void):()=>void;
   /** Requires window.resize. Optional on older hosts; contains no process identity. */

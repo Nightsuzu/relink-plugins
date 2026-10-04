@@ -29,8 +29,9 @@
   // [宽, 高, 下圆角, 上圆角]；宿主的可点击区域按同样的数字裁剪，改这里要同步改宿主。
   const SHAPE = { notch: [188, 28, 14, 0], compact: [304, 58, 29, 29], expanded: [384, 372, 28, 28] };
   const HEADER = { minWidth: 186, maxWidth: 302, minHeight: 26, maxHeight: 56 };
-  // 宿主在收回 600 ms 后把窗口可绘制区域缩到浮岛大小，收回动画必须在此之前结束。
+  // 新宿主等实际动画完成后再裁剪；旧宿主保留 600 ms 兼容路径。
   const CLOSE_DEADLINE = 520;
+  const trackedMorph = typeof bridge.completeDisplayTransition === 'function';
   const PLAYER_ICONS = new Set(['qqmusic', 'netease']);
 
   let mode = 'compact', gameMode = false, hoverAllowed = true, topInset = 18;
@@ -54,6 +55,19 @@
   const values = [304, 58, 29, topInset, .88, 29], velocity = [0, 0, 0, 0, 0, 0];
   let target = [...values];
   let frame = 0, lastTime = 0, firstFrame = false, deadline = Infinity;
+  let closingElapsed = 0, closing = false, morph = null;
+  function finishMorph() {
+    if (!morph?.ready || !shapeResting()) return;
+    const token = morph.token; morph = null;
+    // Defer to the next paint so the native input shape never clips that frame.
+    requestAnimationFrame(() => { void bridge.completeDisplayTransition(token).catch(() => {}); });
+  }
+  async function tellHost(next, token) {
+    if (trackedMorph) morph = { token, ready:false };
+    if (bridge.setDisplayState) await bridge.setDisplayState(next, trackedMorph ? token : undefined);
+    else await bridge.action(next === 'expanded' || (gameMode && next === 'compact') ? 'expand' : 'collapse');
+    if (morph?.token === token) morph.ready = true;
+  }
   // 标题内容淡入淡出：fade 是不透明度，fadeDirection 为 -1 淡出、1 淡入、0 静止。
   let fade = 1, fadeDirection = 0;
   // 只有进出刘海时标题栏才跟着高度缩放；收起↔展开时固定 56 px，避免回弹带动文字。
@@ -76,6 +90,7 @@
   }
   function settleShape() {
     values.splice(0, values.length, ...target); velocity.fill(0); deadline = Infinity;
+    closing = false;
     if (mode !== 'notch') notchBlend = false;
   }
   function shapeResting() {
@@ -91,6 +106,7 @@
     let dt = Math.max(0, (time - lastTime) / 1000); lastTime = time;
     // 第一帧被调度或显卡拖慢时不跳过开头；之后每帧最多推进 50 ms。
     dt = Math.min(dt, firstFrame ? 1 / 60 : .05); firstFrame = false;
+    if (closing) closingElapsed += dt * 1000;
     if (!shapeResting()) {
       const decay = Math.exp(-DAMPING * dt), sin = Math.sin(FREQUENCY * dt), cos = Math.cos(FREQUENCY * dt);
       for (let i = 0; i < values.length; i++) {
@@ -98,7 +114,7 @@
         values[i] = target[i] + decay * (x * cos + b * sin);
         velocity[i] = decay * ((b * FREQUENCY - DAMPING * x) * cos - (x * FREQUENCY + DAMPING * b) * sin);
       }
-      if (shapeResting() || performance.now() >= deadline) settleShape();
+      if (shapeResting() || (trackedMorph ? closing && closingElapsed >= CLOSE_DEADLINE : performance.now() >= deadline)) settleShape();
     } else if (deadline !== Infinity || notchBlend) settleShape();
     if (fadeDirection < 0) {
       fade = Math.max(0, fade - dt / .09);
@@ -108,6 +124,7 @@
       if (fade === 1) fadeDirection = 0;
     }
     paint();
+    finishMorph();
     if (!shapeResting() || fadeDirection) frame = requestAnimationFrame(step);
   }
   function run() {
@@ -115,16 +132,19 @@
       cancelAnimationFrame(frame); frame = 0; settleShape();
       if (fadeDirection) { writeHeader(desiredHeader()); fade = 1; fadeDirection = 0; }
       paint();
+      finishMorph();
     } else if (!frame) { lastTime = performance.now(); firstFrame = true; frame = requestAnimationFrame(step); }
   }
   // closing: true = 收回（设期限），false = 放大（取消期限），不传 = 只是悬停或设置变化（保持原样）。
   // snap: 不做动画，直接到位。
-  function retarget(closing, snap = false) {
+  function retarget(closingRequest, snap = false) {
     const [width, height, radius, topRadius] = SHAPE[mode];
     const surface = mode === 'expanded' ? 1 : mode === 'notch' ? 1 - settings.notchTransparency / 100 : hovered ? .97 : .88;
     target = [width, height, radius, gameMode ? 0 : topInset, surface, topRadius];
-    if (closing === true) deadline = performance.now() + CLOSE_DEADLINE;
-    else if (closing === false) deadline = Infinity;
+    if (closingRequest === true) { deadline = performance.now() + CLOSE_DEADLINE; closingElapsed = 0; }
+    else if (closingRequest === false) deadline = Infinity;
+    // The renderer's elapsed time excludes a delayed first frame / focus stall.
+    if (closingRequest !== undefined) closing = closingRequest;
     if (snap) {
       cancelAnimationFrame(frame); frame = 0; settleShape();
       writeHeader(desiredHeader()); fade = 1; fadeDirection = 0; paint();
@@ -191,9 +211,9 @@
     // 收回：先动画，宿主稍后再缩窗口。放大：等宿主把可绘制区域放大后再动，否则会被裁掉。
     if (!opening) { retarget(true); syncHeader(); }
     try {
-      if (bridge.setDisplayState) await bridge.setDisplayState(next);
-      else await bridge.action(next === 'expanded' || (gameMode && next === 'compact') ? 'expand' : 'collapse');
+      await tellHost(next, generation);
       if (generation === epoch && opening) { retarget(false); syncHeader(); }
+      finishMorph();
     } catch {
       if (generation !== epoch) return;
       applyMode(collapsedMode()); retarget(true); syncHeader();
@@ -210,12 +230,12 @@
     hoverBlocked = gameMode && (requireFreshHover || !hoverAllowed);
     island.classList.toggle('game', gameMode);
     $('mode-hint').textContent = gameMode ? '游戏模式 · 贴顶收起' : '通话随身，桌面留白';
-    // 游戏收走鼠标时，宿主会立刻把可绘制区域裁成刘海大小（不等 600 ms）。
-    // 这时如果还慢慢缩回去，画面就是“被裁掉一半的收起布局”，所以直接到位。
-    const snap = gameMode && !hoverAllowed && mode === 'compact';
+    // Input becomes click-through immediately; visuals may still finish smoothly.
+    const snap = !trackedMorph && gameMode && !hoverAllowed && mode === 'compact';
     const next = collapsedMode();
     if (next !== mode) applyMode(next);
     retarget(true, snap); if (!snap) syncHeader();
+    if (trackedMorph) void tellHost(next, epoch).then(finishMorph).catch(() => {});
   }
 
   // ---------------------------------------------------------------- 视图

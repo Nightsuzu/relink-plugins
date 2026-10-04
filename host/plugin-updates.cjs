@@ -53,7 +53,7 @@ class PluginUpdates {
       if(item.manifest.id!==id||item.manifest.version!==u.version||item.contentHash!==u.contentHash||item.manifest.apiVersion>2)throw Error('插件版本或授权信息不匹配。');
       await h.serialize(async()=>{
         if(this.stopped||h.disposed||h.incident)throw Error('插件更新已停止。');
-        const old=h.records.get(id);if(!old||!newer(item.manifest.version,old.manifest.version))return;
+        const old=h.records.get(id);if(old!==original||old.removed||!newer(item.manifest.version,old.manifest.version))return;
         await h.check(old);
         const added=item.manifest.capabilities.filter(c=>!old.manifest.capabilities.includes(c));
         if(added.length){

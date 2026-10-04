@@ -10,7 +10,8 @@ contextBridge.exposeInMainWorld('relinkPlugin', Object.freeze({
   switchChannel: value => ipcRenderer.invoke('relink:plugin:switch-channel', value),
   getState: () => ipcRenderer.invoke('relink:plugin:state'),
   action: name => ipcRenderer.invoke('relink:plugin:action', name),
-  setDisplayState: value => ipcRenderer.invoke('relink:plugin:display-state', value),
+  setDisplayState: (value, transition) => ipcRenderer.invoke('relink:plugin:display-state', value, transition),
+  completeDisplayTransition: transition => ipcRenderer.invoke('relink:plugin:display-settled', transition),
   onDismiss: callback => {
     if (typeof callback !== 'function') return () => {};
     const listener = () => callback();
