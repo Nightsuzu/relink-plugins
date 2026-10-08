@@ -1,6 +1,9 @@
 'use strict';
 const crypto = require('node:crypto');
-const MAX_BYTES = 2 * 1024 * 1024;
+// Limits apply to the complete .rlplugin file, including its authorization.
+const MAX_BYTES = 100 * 1024 * 1024;
+const MAX_ASSET_BYTES = Math.floor(MAX_BYTES * 3 / 4);
+const AUTHORIZATION_RESERVE = 1024;
 const CAPABILITIES = ['voice.read', 'voice.mute', 'voice.deafen', 'app.show', 'window.resize', 'music.read', 'music.control', 'music.lyrics', 'channels.read', 'channels.switch'];
 class PluginViolation extends Error {
   constructor(code) { super(`插件授权校验失败：${code}`); this.name = 'PluginViolation'; this.code = code; }
@@ -16,9 +19,9 @@ function exact(value, keys, code) {
 }
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 function inspectPackage(input) {
-  const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input);
-  if (bytes.length > MAX_BYTES) fail('package-size');
-  let pkg; try { pkg = JSON.parse(bytes.toString('utf8')); } catch { fail('package-json'); }
+  const bytes = typeof input === 'string' || Buffer.isBuffer(input) ? input : Buffer.from(input);
+  if ((typeof bytes === 'string' ? Buffer.byteLength(bytes) : bytes.length) > MAX_BYTES) fail('package-size');
+  let pkg; try { pkg = JSON.parse(typeof bytes === 'string' ? bytes : bytes.toString('utf8')); } catch { fail('package-json'); }
   exact(pkg, ['format', 'manifest', 'files', 'authorization'], 'package-fields');
   if (pkg.format !== 1) fail('package-format');
   const m = pkg.manifest;
@@ -34,14 +37,18 @@ function inspectPackage(input) {
   const seen = new Set(), assets = new Map(), hashes = {};
   let size = 0;
   for (const file of paths.sort()) {
-    // A flat, deliberately small asset format: no archives, symlinks or traversal.
+    // Flat assets only: no archives, symlinks or traversal.
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\.(html|js|css|svg|png|webp)$/.test(file) || seen.has(file.toLowerCase())) fail('asset-path');
     seen.add(file.toLowerCase());
     const encoded = pkg.files[file];
-    if (typeof encoded !== 'string' || encoded.length > MAX_BYTES || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) fail('asset-encoding');
+    // A repeated capture over a large base64 string can exhaust the regexp
+    // stack. Validate characters and the final padding with bounded patterns.
+    if (typeof encoded !== 'string' || encoded.length > MAX_BYTES || encoded.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(encoded)) fail('asset-encoding');
+    const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
+    if (encoded.indexOf('=') !== (padding ? encoded.length - padding : -1)) fail('asset-encoding');
     const decoded = Buffer.from(encoded, 'base64');
     size += decoded.length;
-    if (size > MAX_BYTES / 2) fail('assets-size');
+    if (size > MAX_ASSET_BYTES) fail('assets-size');
     assets.set(file, decoded); hashes[file] = digest(decoded);
   }
   if (typeof m.entry !== 'string' || !m.entry.endsWith('.html') || !assets.has(m.entry)) fail('entry');
@@ -65,8 +72,8 @@ function inspectPackage(input) {
   const contentHash = digest(Buffer.from(canonical({ format: 1, manifest: m, hashes })));
   return { pkg, manifest: m, assets, contentHash, packageHash: digest(bytes), size };
 }
-function verifyPackage(input, authority, { now = Date.now() } = {}) {
-  const inspected = inspectPackage(input), a = inspected.pkg.authorization;
+function verifyAuthorization(record, authority, { now = Date.now() } = {}) {
+  const inspected = record, a = record.authorization;
   exact(a, ['keyId', 'pluginId', 'version', 'contentHash', 'issuedAt', 'expiresAt', 'signature'], 'authorization-fields');
   if (a.pluginId !== inspected.manifest.id || a.version !== inspected.manifest.version || a.contentHash !== inspected.contentHash) fail('authorization-binding');
   if (typeof a.keyId !== 'string' || !Object.hasOwn(authority.keys || {}, a.keyId)) fail('unknown-issuer');
@@ -76,13 +83,26 @@ function verifyPackage(input, authority, { now = Date.now() } = {}) {
   const { signature, ...payload } = a;
   let valid = false; try { valid = crypto.verify(null, Buffer.from(canonical(payload)), authority.keys[a.keyId], Buffer.from(signature, 'base64')); } catch { /* Fail closed. */ }
   if (!valid) fail('signature');
+}
+function verifyPackage(input, authority, options) {
+  const inspected = inspectPackage(input);
+  verifyAuthorization({ ...inspected, authorization: inspected.pkg.authorization }, authority, options);
   return inspected;
 }
-function authorizePackage(input, privateKey, keyId, { issuedAt = Date.now(), expiresAt = 0 } = {}) {
+function runtimePackage(inspected) {
+  // The decoded assets are sufficient for serving the plugin. Do not retain
+  // a second, base64-encoded copy of every asset in long-lived host records.
+  const { pkg, ...record } = inspected;
+  return { ...record, authorization: { ...pkg.authorization } };
+}
+function authorizePackage(input, privateKey, keyId, { issuedAt = Date.now(), expiresAt = 0, expectedContentHash } = {}) {
   const { pkg, manifest, contentHash } = inspectPackage(input);
+  if (expectedContentHash !== undefined && expectedContentHash !== contentHash) fail('authorization-binding');
   const payload = { keyId, pluginId: manifest.id, version: manifest.version, contentHash, issuedAt, expiresAt };
   pkg.authorization = { ...payload, signature: crypto.sign(null, Buffer.from(canonical(payload)), privateKey).toString('base64') };
-  return Buffer.from(JSON.stringify(pkg));
+  const bytes = Buffer.from(JSON.stringify(pkg));
+  if (bytes.length > MAX_BYTES) fail('package-size');
+  return bytes;
 }
 function pluginSettings(manifest, saved={}, patch={}) {
   if(!patch||typeof patch!=='object'||Array.isArray(patch))throw Error('插件设置无效。');
@@ -94,4 +114,4 @@ function pluginSettings(manifest, saved={}, patch={}) {
     result[s.key]=Object.hasOwn(patch,s.key)?patch[s.key]:valid(saved?.[s.key])?saved[s.key]:s.default;
   }return result;
 }
-module.exports = { MAX_BYTES, CAPABILITIES, PluginViolation, canonical, digest, inspectPackage, verifyPackage, authorizePackage, pluginSettings };
+module.exports = { MAX_BYTES, MAX_ASSET_BYTES, AUTHORIZATION_RESERVE, CAPABILITIES, PluginViolation, canonical, digest, inspectPackage, verifyPackage, verifyAuthorization, runtimePackage, authorizePackage, pluginSettings };

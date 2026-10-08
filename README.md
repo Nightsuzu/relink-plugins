@@ -1,10 +1,10 @@
 # Relink Plugins
 
-Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1、v2 / SDK 0.3.1**。代码开源许可与 Relink 客户端的发布授权分别管理。
+Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1、v2 / SDK 0.3.2**。代码开源许可与 Relink 客户端的发布授权分别管理。
 
 [官网开发文档与提交入口](https://relinkus.cn/plugins/) · [审核与发布指南](docs/publishing.md)
 
-桌面插件需要支持相应插件 API 的客户端。开发时使用独立预览环境，安装前核对插件与宿主版本的兼容性。
+桌面插件需要支持相应插件 API 的客户端。超过 2 MiB 的插件需要 Relink 1.1.0 补丁 5 或更新版本。开发时使用独立预览环境，安装前核对插件与宿主版本的兼容性。
 
 ## 最小示例
 
@@ -20,7 +20,7 @@ node tools/preview.cjs examples/hello-relink
 node tools/pack.cjs examples/hello-relink hello-relink.unsigned.rlplugin
 ```
 
-`manifest.json` 声明插件 ID、名称、版本、API 版本、入口和权限。示例只使用 HTML / CSS / JS。资源限定为同一目录的普通文件，最多 32 个，解码后的总资源最多 1 MiB，整个包最多 2 MiB。不支持本地 Node 模块、原生 DLL、网络地址和任意目录访问。
+`manifest.json` 声明插件 ID、名称、版本、API 版本、入口和权限。示例只使用 HTML / CSS / JS。资源限定为同一目录的普通文件，最多 32 个，解码后的总资源最多 75 MiB，整个签名安装包最多 100 MiB（界面标为 100 MB），打包器为授权信息预留 1 KiB。不支持本地 Node 模块、原生 DLL、网络地址和任意目录访问。
 
 **未授权包用于审核，不要导入正式客户端。** 导入未授权插件会触发 Relink 的安全退出策略。`preview.cjs` 在本机启动使用模拟数据的独立浏览器预览，不连接 Relink，不要求授权，也不使用账户信息；正式客户端没有关闭校验的开发开关。预览只验证界面；生产沙箱与真实通话需要独立 Electron 宿主测试。
 

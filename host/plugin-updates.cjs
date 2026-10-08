@@ -1,12 +1,12 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { MAX_BYTES, verifyPackage, pluginSettings } = require('../runtime/package.cjs');
+const { MAX_BYTES, verifyPackage, runtimePackage, pluginSettings } = require('../runtime/package.cjs');
 const ORIGIN = 'https://relinkus.cn';
 const version = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value.split('.').map(Number) : null;
 function newer(a,b) { const x=version(a),y=version(b); if(!x||!y)return false;for(let i=0;i<3;i++)if(x[i]!==y[i])return x[i]>y[i];return false; }
-async function bounded(fetcher,url,limit) {
-  const response=await fetcher(url,{cache:'no-store',redirect:'error',credentials:'omit',signal:AbortSignal.timeout(25000)});
+async function bounded(fetcher,url,limit,timeout=25000) {
+  const response=await fetcher(url,{cache:'no-store',redirect:'error',credentials:'omit',signal:AbortSignal.timeout(timeout)});
   if(!response.ok||Number(response.headers.get('content-length'))>limit)throw Error('插件下载暂不可用，请稍后重试。');
   let size=0;const parts=[];for await(const part of response.body){size+=part.length;if(size>limit)throw Error('插件数据超过大小限制。');parts.push(Buffer.from(part));}
   return Buffer.concat(parts);
@@ -47,7 +47,7 @@ class PluginUpdates {
     if(this.stopped||!original||!u||!['available','failed','permission-required'].includes(u.status))throw Error('没有可安装的插件更新。');
     if(this.jobs.has(id))return h.list();this.jobs.add(id);u.status='downloading';u.error='';h.notify();
     try {
-      const bytes=await bounded(this.fetch,ORIGIN+'/plugins-api/download/'+u.id,MAX_BYTES);
+      const bytes=await bounded(this.fetch,ORIGIN+'/plugins-api/download/'+u.id,MAX_BYTES,300000);
       // Untrusted network failures never trigger the installed-plugin shutdown policy.
       let item;try {item=verifyPackage(bytes,h.authority);}catch {throw Error('下载的插件未通过授权校验，原插件未改变。');}
       if(item.manifest.id!==id||item.manifest.version!==u.version||item.contentHash!==u.contentHash||item.manifest.apiVersion>2)throw Error('插件版本或授权信息不匹配。');
@@ -71,7 +71,7 @@ class PluginUpdates {
           await fs.copyFile(file,previous);
           await fs.writeFile(journal,JSON.stringify({id,previousHash:old.packageHash}),{flag:'w'});
           await h.release(old);await fs.rename(tmp,file);replaced=true;
-          const record={...item,file,builtin:false,window:null,error:null};h.records.set(id,record);
+          const record={...runtimePackage(item),file,builtin:false,window:null,error:null};h.records.set(id,record);
           h.preferences[id]={...pref,settings:pluginSettings(item.manifest,pref.settings)};
           await h.sync(record);
           if(record.window)await new Promise(resolve=>setTimeout(resolve,350));

@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { authorizePackage, verifyPackage, inspectPackage, PluginViolation } = require('../runtime/package.cjs');
+const { MAX_BYTES, authorizePackage, verifyPackage, inspectPackage, PluginViolation } = require('../runtime/package.cjs');
 const pair = crypto.generateKeyPairSync('ed25519');
 const authority = { keys: { test: pair.publicKey.export({ type: 'spki', format: 'pem' }) }, revoked: [] };
 function unsigned(patch = {}) {
@@ -14,6 +14,12 @@ test('signed exact-content approval succeeds and never returns private keys', ()
   const p = verifyPackage(signed(), authority); assert.equal(p.manifest.id, 'test-island'); assert.equal(p.assets.get('index.html').toString(), '<html></html>'); assert.equal(p.pkg.privateKey, undefined);
 });
 test('unsigned packages are rejected before execution', () => reject(unsigned(), 'authorization-fields'));
+
+test('authorization binds the exact reviewed hash without a second package inspection', () => {
+  const input=unsigned(),expectedContentHash=inspectPackage(input).contentHash;
+  assert.equal(verifyPackage(signed(input,{expectedContentHash}),authority).contentHash,expectedContentHash);
+  assert.throws(()=>signed(unsigned({name:'changed after review'}),{expectedContentHash}),e=>e.code==='authorization-binding');
+});
 test('asset tampering, extra files and manifest permission changes invalidate approval', () => {
   for (const mutate of [p => { p.files['index.html'] = Buffer.from('changed').toString('base64'); }, p => { p.files['extra.js'] = Buffer.from('extra').toString('base64'); }, p => { p.manifest.capabilities.push('app.show'); }, p => { p.manifest.entry = 'other.html'; p.files['other.html'] = p.files['index.html']; }]) {
     const p = JSON.parse(signed()); mutate(p); reject(JSON.stringify(p), 'authorization-binding');
@@ -38,6 +44,17 @@ test('traversal, case collisions and unsupported script types are rejected', () 
 });
 test('malformed assets, oversized packages and unknown capabilities cannot be packed', () => {
   const p = JSON.parse(unsigned()); p.files['index.html'] = '!not-base64'; assert.throws(() => inspectPackage(JSON.stringify(p)), PluginViolation);
-  assert.throws(() => inspectPackage(Buffer.alloc(2097153)), PluginViolation);
+  assert.throws(() => inspectPackage(Buffer.alloc(MAX_BYTES+1)), e => e instanceof PluginViolation && e.code === 'package-size');
   assert.throws(() => inspectPackage(unsigned({ capabilities: ['filesystem.write'] })), PluginViolation);
+});
+
+test('base64 padding remains strict without recursive matching on large assets', () => {
+  for (const value of ['A===','AA=A','AAAA====','AAA','AA==AAAA','AA\n=']) {
+    const p=JSON.parse(unsigned());p.files['index.html']=value;
+    assert.throws(()=>inspectPackage(JSON.stringify(p)), e=>e.code==='asset-encoding');
+  }
+  for(const value of ['','AA==','AAA=','AAAA']){
+    const p=JSON.parse(unsigned());p.files['index.html']=value;
+    assert.doesNotThrow(()=>inspectPackage(JSON.stringify(p)));
+  }
 });

@@ -1,8 +1,8 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
-const { MAX_BYTES, PluginViolation, verifyPackage, digest, pluginSettings } = require('../runtime/package.cjs');
+const { randomUUID, createHash } = require('node:crypto');
+const { MAX_BYTES, PluginViolation, verifyPackage, verifyAuthorization, runtimePackage, digest, pluginSettings } = require('../runtime/package.cjs');
 const { sanitizeState, allowedAsset, actionPolicy, limiter } = require('./plugin-policy.cjs');
 const { candidates } = require('./game-catalog.cjs');
 const { PluginServices } = require('./plugin-services.cjs');
@@ -31,11 +31,13 @@ class PluginHost {
   }
   async readPackage(file) {
     const stat = await fs.lstat(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES) throw new PluginViolation('package-file');
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new PluginViolation('package-file');
+    if (stat.size > MAX_BYTES) throw Object.assign(new Error('插件安装包不能超过 100 MB。'), { code:'PLUGIN_TOO_LARGE' });
     const handle = await fs.open(file, 'r');
     try {
       const opened = await handle.stat();
-      if (!opened.isFile() || opened.size > MAX_BYTES) throw new PluginViolation('package-file');
+      if (!opened.isFile()) throw new PluginViolation('package-file');
+      if (opened.size > MAX_BYTES) throw Object.assign(new Error('插件安装包不能超过 100 MB。'), { code:'PLUGIN_TOO_LARGE' });
       // Read at most one byte beyond the observed size: concurrent growth cannot allocate arbitrary memory.
       const buffer = Buffer.alloc(opened.size + 1);
       let length = 0;
@@ -67,7 +69,7 @@ class PluginHost {
       try { item = await this.readPackage(full); }
       catch (e) { if (e instanceof PluginViolation) e.managedFile = full; throw e; }
       if (file !== `${item.manifest.id}.rlplugin` || this.records.has(item.manifest.id)) { const error = new PluginViolation('duplicate-identity'); error.managedFile = full; throw error; }
-      this.records.set(item.manifest.id, { ...item, file: full, builtin: false, window: null, error: null });
+      this.records.set(item.manifest.id, { ...runtimePackage(item), file: full, builtin: false, window: null, error: null });
     }
     this.register();
     this.mainWindow = this.getWindow();
@@ -120,7 +122,7 @@ class PluginHost {
       const tmp = file + '.tmp'; await fs.writeFile(tmp, bytes); await fs.rename(tmp, file);
       this.release(existing);
       this.preferences[item.manifest.id] = { ...this.pref(item.manifest.id),enabled:false };
-      this.records.set(item.manifest.id,{ ...item,packageHash:digest(bytes),file,builtin:false,window:null,error:null });
+      this.records.set(item.manifest.id,{ ...runtimePackage(item),packageHash:digest(bytes),file,builtin:false,window:null,error:null });
       await this.save(); this.notify();
       if (main && !main.isDestroyed()) main.webContents.send('relink:plugins:installed',{ id:item.manifest.id });
       return this.list();
@@ -401,8 +403,37 @@ class PluginHost {
     }
   }
   async check(r) {
-    let current; try { current = await this.readPackage(r.file); } catch (e) { const error = e instanceof PluginViolation ? e : new PluginViolation('package-missing'); error.managedFile = r.file; throw error; }
-    if (current.packageHash !== r.packageHash) { const error = new PluginViolation('package-changed'); error.managedFile = r.file; throw error; }
+    let handle;
+    try {
+      verifyAuthorization(r, this.authority);
+      const entry = await fs.lstat(r.file);
+      if (!entry.isFile() || entry.isSymbolicLink()) throw new PluginViolation('package-file');
+      if (entry.size > MAX_BYTES) throw new PluginViolation('package-size');
+      handle = await fs.open(r.file, 'r');
+      const before = await handle.stat();
+      if (!before.isFile() || before.dev !== entry.dev || before.ino !== entry.ino || before.size !== entry.size) throw new PluginViolation('package-changed');
+      // Hash every byte, including for disabled plugins, without repeatedly
+      // parsing JSON or allocating/decoding up to 100 MB of base64 assets.
+      const chunk = Buffer.alloc(64 * 1024), hash = createHash('sha256');
+      let length = 0;
+      while (true) {
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+        if (length > before.size || length > MAX_BYTES) throw new PluginViolation('package-changed');
+        hash.update(chunk.subarray(0, bytesRead));
+      }
+      const after = await handle.stat(), current = await fs.lstat(r.file);
+      if (!current.isFile() || current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino ||
+          length !== before.size || after.size !== before.size || current.size !== before.size ||
+          after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+          current.mtimeMs !== before.mtimeMs || current.ctimeMs !== before.ctimeMs || hash.digest('hex') !== r.packageHash) throw new PluginViolation('package-changed');
+      // Revocation or expiry may have changed while a large file was read.
+      verifyAuthorization(r, this.authority);
+    } catch (e) {
+      const error = e instanceof PluginViolation ? e : new PluginViolation('package-missing');
+      error.managedFile = r.file; throw error;
+    } finally { await handle?.close(); }
   }
   async sync(r) {
     const show = !r.removed && !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);

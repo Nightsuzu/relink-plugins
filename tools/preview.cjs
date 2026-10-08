@@ -3,7 +3,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { inspectPackage, MAX_BYTES } = require('../runtime/package.cjs');
+const { inspectPackage, MAX_ASSET_BYTES } = require('../runtime/package.cjs');
 const source = path.resolve(process.argv[2] || path.join(__dirname, '../examples/hello-relink'));
 const manifest = JSON.parse(fs.readFileSync(path.join(source, 'manifest.json'), 'utf8'));
 const files = {};
@@ -13,8 +13,8 @@ let size = 0;
 for (const file of entries) {
   if (file === 'manifest.json') continue;
   const full = path.join(source, file), stat = fs.lstatSync(full);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES / 2) throw new Error('Only flat regular assets up to 1 MiB are supported.');
-  size += stat.size; if (size > MAX_BYTES / 2) throw new Error('Total assets exceed 1 MiB.');
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_ASSET_BYTES) throw new Error('Only flat regular assets up to 75 MiB are supported.');
+  size += stat.size; if (size > MAX_ASSET_BYTES) throw new Error('Total assets exceed 75 MiB.');
   files[file] = fs.readFileSync(full).toString('base64');
 }
 const { assets } = inspectPackage(JSON.stringify({ format: 1, manifest, files }));
