@@ -1,7 +1,8 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { MAX_BYTES, verifyPackage, runtimePackage, pluginSettings } = require('../runtime/package.cjs');
+const { MAX_BYTES, API_VERSIONS, verifyPackage, runtimePackage, pluginSettings } = require('../runtime/package.cjs');
+const { permissionSummary } = require('./plugin-policy.cjs');
 const ORIGIN = 'https://relinkus.cn';
 const version = value => typeof value === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value) ? value.split('.').map(Number) : null;
 function newer(a,b) { const x=version(a),y=version(b); if(!x||!y)return false;for(let i=0;i<3;i++)if(x[i]!==y[i])return x[i]>y[i];return false; }
@@ -30,9 +31,10 @@ class PluginUpdates {
         if(!data.ok||!Array.isArray(data.result?.items)||data.result.items.length>500)throw Error('插件更新信息无效。');
         if(this.stopped)return h.list();
         for(const r of h.records.values()){
+          if(r.dev)continue;
           const row=data.result.items.filter(v=>v?.status==='approved'&&v.manifest?.id===r.manifest.id&&/^[a-f0-9-]{36}$/.test(v.id)&&/^[a-f0-9]{64}$/.test(v.contentHash)&&newer(v.manifest.version,r.manifest.version)).sort((a,b)=>newer(a.manifest.version,b.manifest.version)?-1:1)[0];
           if(!this.jobs.has(r.manifest.id)) {
-            if(row)this.available.set(r.manifest.id,{id:row.id,version:row.manifest.version,contentHash:row.contentHash,apiVersion:row.manifest.apiVersion,status:row.manifest.apiVersion>2?'client-required':'available',error:''});
+            if(row)this.available.set(r.manifest.id,{id:row.id,version:row.manifest.version,contentHash:row.contentHash,apiVersion:row.manifest.apiVersion,status:API_VERSIONS.includes(row.manifest.apiVersion)?'available':'client-required',error:''});
             else this.available.delete(r.manifest.id);
           }
         }
@@ -50,15 +52,17 @@ class PluginUpdates {
       const bytes=await bounded(this.fetch,ORIGIN+'/plugins-api/download/'+u.id,MAX_BYTES,300000);
       // Untrusted network failures never trigger the installed-plugin shutdown policy.
       let item;try {item=verifyPackage(bytes,h.authority);}catch {throw Error('下载的插件未通过授权校验，原插件未改变。');}
-      if(item.manifest.id!==id||item.manifest.version!==u.version||item.contentHash!==u.contentHash||item.manifest.apiVersion>2)throw Error('插件版本或授权信息不匹配。');
+      if(item.manifest.id!==id||item.manifest.version!==u.version||item.contentHash!==u.contentHash||!API_VERSIONS.includes(item.manifest.apiVersion))throw Error('插件版本或授权信息不匹配。');
       await h.serialize(async()=>{
         if(this.stopped||h.disposed||h.incident)throw Error('插件更新已停止。');
         const old=h.records.get(id);if(old!==original||old.removed||!newer(item.manifest.version,old.manifest.version))return;
         await h.check(old);
         const added=item.manifest.capabilities.filter(c=>!old.manifest.capabilities.includes(c));
-        if(added.length){
+        // A new host to reach is a new permission too, even with the same capabilities.
+        const hosts=(item.manifest.network||[]).filter(n=>!(old.manifest.network||[]).includes(n));
+        if(added.length||hosts.length){
           if(automatic){u.status='permission-required';return;}
-          const options={type:'question',title:'插件新增权限',message:`${item.manifest.name} · v${item.manifest.version}`,detail:'这个版本新增以下权限：\n'+added.join('\n'),buttons:['允许并更新','暂不更新'],defaultId:1,cancelId:1,noLink:true};
+          const options={type:'question',title:'插件新增权限',message:`${item.manifest.name} · v${item.manifest.version}`,detail:'这个版本新增以下权限：\n'+permissionSummary(item.manifest,{capabilities:added,hosts}),buttons:['允许并更新','暂不更新'],defaultId:1,cancelId:1,noLink:true};
           const main=h.getWindow(),answer=main&&!main.isDestroyed()?await h.dialog.showMessageBox(main,options):await h.dialog.showMessageBox(options);
           if(answer.response!==0){u.status='permission-required';return;}
         }

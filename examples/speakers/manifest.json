@@ -1,0 +1,10 @@
+{
+  "id": "speakers-board",
+  "name": "说话者看板",
+  "version": "0.1.0",
+  "apiVersion": 3,
+  "description": "API v3 示例：在语音页右侧面板显示谁在说话，并用通话按钮标记精彩时刻。",
+  "capabilities": ["voice.participants"],
+  "commands": [{ "id": "mark", "title": "标记此刻", "icon": "mark.svg" }],
+  "panel": { "entry": "panel.html", "title": "说话者" }
+}

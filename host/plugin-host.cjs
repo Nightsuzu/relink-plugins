@@ -2,22 +2,33 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID, createHash } = require('node:crypto');
-const { MAX_BYTES, PluginViolation, verifyPackage, verifyAuthorization, runtimePackage, digest, pluginSettings } = require('../runtime/package.cjs');
-const { sanitizeState, allowedAsset, actionPolicy, limiter } = require('./plugin-policy.cjs');
+const { MAX_BYTES, API_VERSIONS, PluginViolation, verifyPackage, verifyAuthorization, runtimePackage, digest, pluginSettings } = require('../runtime/package.cjs');
+const { sanitizeState, allowedAsset, actionPolicy, limiter, permissionSummary } = require('./plugin-policy.cjs');
 const { candidates } = require('./game-catalog.cjs');
 const { PluginServices } = require('./plugin-services.cjs');
 const { PluginPointer } = require('./plugin-pointer.cjs');
 const { PluginUpdates } = require('./plugin-updates.cjs');
+const { PluginV3 } = require('./plugin-v3.cjs');
+const { PluginDeveloper } = require('./plugin-developer.cjs');
+const { PluginSecrets } = require('./plugin-secrets.cjs');
+const { PluginNetwork } = require('./plugin-network.cjs');
+const { PluginChat } = require('./plugin-chat.cjs');
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'none'";
 const MIME = { html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml', png: 'image/png', webp: 'image/webp' };
 class PluginHost {
-  constructor({ app, BrowserWindow, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit, listGameWindows, mediaService }) {
-    Object.assign(this, { app, BrowserWindow, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit, listGameWindows, mediaService });
+  constructor({ app, BrowserWindow, WebContentsView, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit, listGameWindows, mediaService, safeStorage, Notification, network }) {
+    Object.assign(this, { app, BrowserWindow, WebContentsView, session, screen, ipcMain, dialog, trustedIpc, getWindow, quit, listGameWindows, mediaService });
     this.root = path.join(app.getPath('userData'), 'authorized-plugins');
     this.authority = require('./plugin-authority.json');
     this.updates = new PluginUpdates(this);
     this.records = new Map(); this.preferences = {}; this.state = sanitizeState();
     this.services = new PluginServices(this, mediaService);
+    this.v3 = new PluginV3(this); this.panelQueue = Promise.resolve();
+    this.developer = new PluginDeveloper(this);
+    // API v4: user secrets, declared-host network access, channel chat, commands, notifications and storage.
+    this.secrets = new PluginSecrets(this, safeStorage);
+    this.network = new PluginNetwork(this, this.secrets, network);
+    this.chat = new PluginChat(this, { Notification });
     this.cursorInteractive = false;
     this.pointer = new PluginPointer(point => this.pointerDown(this.screen.screenToDipPoint(point)), value => this.setCursorInteractive(value));
     this.disposed = false; this.incident = null; this.queue = Promise.resolve(); this.gameMode = false;
@@ -52,6 +63,7 @@ class PluginHost {
   }
   async initialize() {
     await fs.mkdir(this.root, { recursive: true });
+    await this.secrets.load();
     try {
       const preferencesFile = path.join(this.root, 'preferences.json');
       if ((await fs.stat(preferencesFile)).size > 65536) throw new Error('Plugin preferences are too large.');
@@ -90,13 +102,119 @@ class PluginHost {
   }
   list() {
     return {
-      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, update:this.updates.state(r.manifest.id), author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], builtin: r.builtin, ...this.pref(r.manifest.id), status: r.recovering ? 'recovering' : r.error ? 'failed' : r.window ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
+      plugins: [...this.records.values()].map(r => ({ id: r.manifest.id, name: r.manifest.name, description: r.manifest.description, version: r.manifest.version, capabilities: r.manifest.capabilities, update:this.updates.state(r.manifest.id), author:r.manifest.author?{name:r.manifest.author.name,avatar:r.manifest.author.avatar?`data:image/${r.manifest.author.avatar.endsWith('.webp')?'webp':'png'};base64,${r.assets.get(r.manifest.author.avatar).toString('base64')}`:''}:null,settingsSchema:r.manifest.settings||[], commands:(r.manifest.commands||[]).map(c => ({ id:c.id, title:c.title, icon:c.icon?`data:image/svg+xml;base64,${r.assets.get(c.icon).toString('base64')}`:'' })), panel:r.manifest.panel?{ title:r.manifest.panel.title }:null, overlay:Boolean(r.manifest.entry), background:Boolean(r.manifest.background), network:[...(r.manifest.network||[])], secrets:this.secrets.status(r), chatCommands:(r.manifest.chatCommands||[]).map(c => ({ name:c.name, description:c.description })), apiVersion:r.manifest.apiVersion, developer:r.dev === true, builtin: r.builtin, ...this.pref(r.manifest.id), status: r.recovering ? 'recovering' : r.error ? 'failed' : this.surfaces(r).length ? 'active' : this.pref(r.manifest.id).enabled ? 'ready' : 'disabled', error: r.error })),
       updates: {...this.updates.status},
+      developer: this.developer.status(),
       displays: this.screen.getAllDisplays().map((d, index) => ({ id: String(d.id), name: d.label || `显示器 ${index + 1}` })),
     };
   }
   notify() { const w = this.getWindow(); if (w && !w.isDestroyed()) w.webContents.send('relink:plugins:changed', this.list()); }
   serialize(operation) { const pending = this.queue.then(operation); this.queue = pending.catch(() => {}); return pending; }
+  /** Panel placement follows layout changes quickly; it must not wait behind installs or audits. */
+  serializePanel(operation) { const pending = this.panelQueue.then(operation); this.panelQueue = pending.catch(() => {}); return pending; }
+  /** Live surfaces of a plugin: the desktop overlay and/or the in-client panel (API v3). */
+  surfaces(r) {
+    const out = [];
+    if (r?.window && !r.window.isDestroyed()) out.push({ kind: 'overlay', wc: r.window.webContents, url: `relink-plugin://${r.manifest.id}/${r.manifest.entry}` });
+    const view = r?.panel?.view;
+    if (view && !view.webContents.isDestroyed()) out.push({ kind: 'panel', wc: view.webContents, url: `relink-plugin://${r.manifest.id}/${r.manifest.panel.entry}` });
+    const bg = r?.backgroundWindow;
+    if (bg && !bg.isDestroyed()) out.push({ kind: 'background', wc: bg.webContents, url: `relink-plugin://${r.manifest.id}/${r.manifest.background}` });
+    return out;
+  }
+  surfaceOf(r, event) { return this.surfaces(r).find(s => s.wc === event.sender)?.kind || 'overlay'; }
+  send(r, channel, value) { for (const s of this.surfaces(r)) s.wc.send(channel, value); }
+  /** One sandboxed, in-memory session per plugin, shared by its overlay and panel. */
+  async ensureSession(r) {
+    if (r.session) return r.session;
+    // Dedicated in-memory partition. No account session, storage or default preload is shared.
+    const ses = this.session.fromPartition(`relink-plugin-${r.manifest.id}`, { cache: false });
+    await ses.protocol.handle('relink-plugin', request => {
+      const name = allowedAsset(request.url, r.manifest.id, r.assets);
+      if (!name || request.method !== 'GET') return new Response('', { status: 403 });
+      return new Response(r.assets.get(name), { headers: { 'Content-Type': MIME[name.split('.').pop()], 'Content-Security-Policy': CSP, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
+    });
+    if (r.removed) { ses.protocol.unhandle('relink-plugin'); return null; }
+    ses.setPermissionCheckHandler(() => false); ses.setPermissionRequestHandler((_wc, _p, callback) => callback(false));
+    ses.setDevicePermissionHandler(() => false);
+    // DevTools load their own frontend through the inspected page's session; only the plugin under development has DevTools.
+    ses.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !allowedAsset(details.url, r.manifest.id, r.assets) && !(r.dev === true && details.url.startsWith('devtools://')) }));
+    ses.on('will-download', event => event.preventDefault());
+    r.session = ses;
+    return ses;
+  }
+  /** DevTools only for the unsigned plugin loaded in developer mode; signed plugins never get them. */
+  sandboxPreferences(ses, r) {
+    return { preload: path.join(__dirname, 'plugin-preload.cjs'), session: ses, nodeIntegration: false, nodeIntegrationInWorker: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, spellcheck: false, devTools: r?.dev === true, backgroundThrottling: true };
+  }
+  lockNavigation(wc) {
+    wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+    wc.on('will-navigate', event => event.preventDefault());
+    wc.on('will-frame-navigate', event => event.preventDefault());
+    wc.on('will-attach-webview', event => event.preventDefault());
+  }
+  /** API v3 panel: a sandboxed view inside the main window, placed by the trusted renderer. */
+  async openPanel(r, bounds) {
+    const main = this.getWindow();
+    if (!main || main.isDestroyed() || !this.WebContentsView || !main.contentView) return;
+    if (!this.surfaces(r).length && [...this.records.values()].filter(item => this.surfaces(item).length).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
+    await this.check(r);
+    const ses = await this.ensureSession(r);
+    if (!ses || r.removed || this.disposed || this.incident) return;
+    const view = new this.WebContentsView({ webPreferences: this.sandboxPreferences(ses, r) });
+    view.setBackgroundColor?.('#00000000');
+    r.panel = { view };
+    r.limit ||= limiter(); r.resizeLimit ||= limiter(24); r.settingsLimit ||= limiter(30);
+    const wc = view.webContents;
+    this.lockNavigation(wc); this.developer.attach(r, wc, 'panel');
+    wc.on('render-process-gone', (_event, details) => { if (r.panel?.view === view) this.handleError(r, new Error('插件面板中断。'), details?.reason === 'oom' ? 'memory' : 'crash'); });
+    main.contentView.addChildView(view);
+    view.setBounds(bounds);
+    try { await wc.loadURL(`relink-plugin://${r.manifest.id}/${r.manifest.panel.entry}`); }
+    catch (error) { if (r.panel?.view === view) this.handleError(r, error); return; }
+    this.notify();
+  }
+  closePanel(r) {
+    const view = r?.panel?.view;
+    if (!view) return;
+    r.panel = null;
+    const main = this.getWindow();
+    try { if (main && !main.isDestroyed()) main.contentView?.removeChildView(view); } catch { /* Window already closing. */ }
+    if (!view.webContents.isDestroyed()) view.webContents.close();
+    this.notify();
+  }
+  /** API v4 background page: an invisible window that runs while the plugin is enabled and signed in. */
+  async openBackground(r) {
+    if (r.backgroundWindow || r.backgroundOpening || !this.BrowserWindow) return;
+    if (!this.surfaces(r).length && [...this.records.values()].filter(item => item !== r && (this.surfaces(item).length || item.opening || item.backgroundOpening)).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
+    r.backgroundOpening = true;
+    let w = null;
+    try {
+      await this.check(r);
+      if (r.removed || this.disposed || this.incident) return;
+      if (!API_VERSIONS.includes(r.manifest.apiVersion)) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
+      const ses = await this.ensureSession(r);
+      if (!ses) return;
+      w = new this.BrowserWindow({ width: 320, height: 200, show: false, frame: false, skipTaskbar: true, focusable: false, title: (r.dev ? '[开发中] ' : '') + r.manifest.name, webPreferences: this.sandboxPreferences(ses, r) });
+      r.backgroundWindow = w; r.limit ||= limiter(); r.resizeLimit ||= limiter(24); r.settingsLimit ||= limiter(30);
+      this.lockNavigation(w.webContents); this.developer.attach(r, w.webContents, 'background');
+      w.webContents.on('render-process-gone', (_event, details) => { if (r.backgroundWindow === w) this.handleError(r, new Error('插件后台中断。'), details?.reason === 'oom' ? 'memory' : 'crash'); });
+      w.once('closed', () => { if (r.backgroundWindow === w) r.backgroundWindow = null; });
+      await w.loadURL(`relink-plugin://${r.manifest.id}/${r.manifest.background}`);
+      if (r.removed || this.disposed || this.incident || !this.state.authenticated || !this.pref(r.manifest.id).enabled) this.closeBackground(r);
+      this.notify();
+    } catch (error) {
+      if (error instanceof PluginViolation) throw error;
+      if (!r.removed && (!w || r.backgroundWindow === w)) this.handleError(r, error);
+    } finally { r.backgroundOpening = false; }
+  }
+  closeBackground(r) {
+    const w = r?.backgroundWindow;
+    if (!w) return;
+    r.backgroundWindow = null;
+    if (!w.isDestroyed()) w.destroy();
+    this.notify();
+  }
   async save() {
     const target = path.join(this.root, 'preferences.json'), tmp = target + '.tmp';
     await fs.writeFile(tmp, JSON.stringify(this.preferences)); await fs.rename(tmp, target);
@@ -110,9 +228,9 @@ class PluginHost {
       catch (e) { if (e instanceof PluginViolation) void this.violation(e); throw e; }
       const existing = this.records.get(item.manifest.id);
       if (existing?.builtin) throw new Error('内置插件随 Relink 更新。');
+      if (existing?.dev) throw new Error('正在开发的插件使用了同一个 ID，请先在开发者模式中移除它。');
       if (!existing && this.records.size >= 16) throw new Error('最多安装 16 个插件。');
-      const labels = { 'voice.read':'读取通话状态','voice.mute':'控制麦克风静音','voice.deafen':'控制耳机拒听','app.show':'返回主窗口','window.resize':'调整插件浮窗','music.read':'读取支持的播放器曲目和封面','music.control':'控制播放器','music.lyrics':'匹配同步歌词（QQ 音乐、网易云、LRCLIB）','channels.read':'读取当前 Room 语音频道','channels.switch':'切换语音频道' };
-      const options = { type:'question',title:existing ? '更新 Relink 插件' : '安装 Relink 插件',message:`${item.manifest.name} · v${item.manifest.version}`,detail:`${item.manifest.description}\n\n允许的功能：${item.manifest.capabilities.map(c => labels[c]).join('、') || '无'}\n\n已验证 Relink 发布签名。安装后默认关闭，可在设置 → 插件中开启。`,buttons:[existing ? '更新插件' : '安装插件','取消'],defaultId:0,cancelId:1,noLink:true };
+      const options = { type:'question',title:existing ? '更新 Relink 插件' : '安装 Relink 插件',message:`${item.manifest.name} · v${item.manifest.version}`,detail:`${item.manifest.description}\n\n${permissionSummary(item.manifest)}\n\n已验证 Relink 发布签名。安装后默认关闭，可在设置 → 插件中开启。`,buttons:[existing ? '更新插件' : '安装插件','取消'],defaultId:0,cancelId:1,noLink:true };
       const main = this.getWindow();
       const confirm = main && !main.isDestroyed() ? await this.dialog.showMessageBox(main, options) : await this.dialog.showMessageBox(options);
       if (confirm.response !== 0 || this.disposed || this.incident) return this.list();
@@ -133,6 +251,8 @@ class PluginHost {
       if (this.disposed || this.incident) throw new Error('插件模块已停止。');
       const r = typeof id === 'string' ? this.records.get(id) : null;
       if (!r || r.builtin) throw new Error('此插件不可卸载。');
+      // A plugin under development is only unloaded; its folder stays untouched.
+      if (r.dev) { this.developer.unload(); this.notify(); return this.list(); }
       const file = path.join(this.root, `${id}.rlplugin`);
       if (!/^[a-z][a-z0-9-]{2,63}$/.test(id) || path.resolve(r.file) !== path.resolve(file)) throw new Error('插件安装位置无效。');
       const options = { type:'question',title:'卸载插件',message:`卸载「${r.manifest.name}」？`,detail:'将关闭此插件，并删除插件及其设置。Relink 和正在进行的通话不受影响。',buttons:['卸载插件','取消'],defaultId:1,cancelId:1,noLink:true };
@@ -159,6 +279,10 @@ class PluginHost {
       }
       this.records.delete(id);
       this.updates.available.delete(id);
+      // Secrets, storage and the network log belong to the plugin and go with it.
+      this.network.forget(id);
+      await this.secrets.forget(id).catch(() => {});
+      await this.chat.forget(id).catch(() => {}); this.chat.forgetPlugin(id);
       this.notify();
       return this.list();
     });
@@ -181,11 +305,11 @@ class PluginHost {
       if (Object.hasOwn(patch, 'enabled')) { if (typeof patch.enabled !== 'boolean') throw new Error('插件设置无效。'); p.enabled = patch.enabled; }
       if (Object.hasOwn(patch, 'displayMode')) { if (!['always', 'voice'].includes(patch.displayMode)) throw new Error('显示方式无效。'); p.displayMode = patch.displayMode; }
       if (Object.hasOwn(patch, 'displayId')) { if (!['primary','auto'].includes(patch.displayId) && !this.screen.getAllDisplays().some(d => String(d.id) === patch.displayId)) throw new Error('显示器不可用。'); p.displayId = patch.displayId; }
-      if (p.enabled) { await this.check(r); if (![1,2].includes(r.manifest.apiVersion)) throw new Error('此插件需要更新版本的 Relink。'); }
+      if (p.enabled) { await this.check(r); if (!API_VERSIONS.includes(r.manifest.apiVersion)) throw new Error('此插件需要更新版本的 Relink。'); }
       if (p.enabled && !this.pref(id).enabled && [...this.records.keys()].filter(other => other !== id && this.pref(other).enabled).length >= 3) throw new Error('最多同时启用 3 个插件，请先关闭一个。');
       this.preferences[id] = p; r.error = null;
       if (Object.hasOwn(patch, 'enabled')) { this.cancelRecovery(r); r.runtimeFailures = []; }
-      await this.save(); await this.sync(r); if (r.window) {this.position(r);r.window.webContents.send('relink:plugin:settings',p.settings);if(r.gameAware)r.window.webContents.send('relink:plugin:presentation',this.presentation(r));} this.notify(); return this.list();
+      await this.save(); await this.sync(r); this.send(r,'relink:plugin:settings',p.settings); if (r.window) {this.position(r);if(r.gameAware)r.window.webContents.send('relink:plugin:presentation',this.presentation(r));} this.notify(); return this.list();
     })));
     this.ipcMain.handle('relink:plugins:install-file', main(file => this.installFile(file)));
     this.ipcMain.handle('relink:plugins:install', main(async () => {
@@ -196,22 +320,32 @@ class PluginHost {
     this.ipcMain.on('relink:plugins:publish', (event, value) => {
       if (!this.trustedIpc(event) || this.incident || this.disposed) return;
       const state = sanitizeState(value); if (JSON.stringify(state) === JSON.stringify(this.state)) return;
+      const voiceChanged = state.inVoice !== this.state.inVoice || state.connected !== this.state.connected;
       this.state = state;
       for (const r of this.records.values()) {
-        if (r.window && r.manifest.capabilities.includes('voice.read')) r.window.webContents.send('relink:plugin:state', state);
+        if (r.manifest.capabilities.includes('voice.read')) this.send(r, 'relink:plugin:state', state);
         void this.sync(r).catch(e => this.handleError(r, e));
       }
+      if (voiceChanged) this.v3.broadcastParticipants();
+      this.chat.broadcast();
     });
-    const plugin = (event) => [...this.records.values()].find(r => r.window && !r.window.isDestroyed() && event.sender === r.window.webContents && event.senderFrame === r.window.webContents.mainFrame && event.senderFrame.url === `relink-plugin://${r.manifest.id}/${r.manifest.entry}`);
+    // The desktop overlay and (API v3) the in-client panel are the same plugin. Geometry
+    // requests only make sense from the overlay; everything else accepts either surface.
+    const plugin = (event, scope = 'any') => [...this.records.values()].find(r => this.surfaces(r).some(s => (scope === 'any' || s.kind === scope) && event.sender === s.wc && event.senderFrame === s.wc.mainFrame && event.senderFrame.url === s.url));
     this.services.register(plugin);
+    this.v3.register(plugin);
+    this.developer.register(main);
+    this.network.register(plugin);
+    this.secrets.register(plugin, main);
+    this.chat.register(plugin);
     this.ipcMain.handle('relink:plugin:settings',event=>{const r=plugin(event);if(!r||this.incident)throw Error('来源不允许。');return this.pref(r.manifest.id).settings;});
-    this.ipcMain.handle('relink:plugin:settings-update',(event,patch)=>{const r=plugin(event);if(!r||this.incident||this.disposed)throw Error('来源不允许。');if(!r.settingsLimit())throw Error('操作过于频繁。');return this.serialize(async()=>{if(plugin(event)!==r||this.incident||this.disposed)throw Error('来源不允许。');const p=this.pref(r.manifest.id);p.settings=pluginSettings(r.manifest,p.settings,patch);this.preferences[r.manifest.id]=p;await this.save();r.window?.webContents.send('relink:plugin:settings',p.settings);this.notify();return p.settings;});});
+    this.ipcMain.handle('relink:plugin:settings-update',(event,patch)=>{const r=plugin(event);if(!r||this.incident||this.disposed)throw Error('来源不允许。');if(!r.settingsLimit())throw Error('操作过于频繁。');return this.serialize(async()=>{if(plugin(event)!==r||this.incident||this.disposed)throw Error('来源不允许。');const p=this.pref(r.manifest.id);p.settings=pluginSettings(r.manifest,p.settings,patch);this.preferences[r.manifest.id]=p;await this.save();this.send(r,'relink:plugin:settings',p.settings);this.notify();return p.settings;});});
     this.ipcMain.handle('relink:plugin:state', (event) => {
       const r = plugin(event); if (!r || this.incident || !r.manifest.capabilities.includes('voice.read')) throw new Error('来源不允许。');
       return this.state;
     });
     this.ipcMain.handle('relink:plugin:presentation', (event) => {
-      const r = plugin(event); if (!r || this.incident || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
+      const r = plugin(event, 'overlay'); if (!r || this.incident || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
       if (!r.gameAware) {
         r.gameAware = true;
         if (this.gameMode) { r.expanded = true; this.position(r); void this.resize(r, false); }
@@ -223,6 +357,7 @@ class PluginHost {
       const r = plugin(event); if (!r || this.incident) throw new Error('来源不允许。');
       // Geometry reversals coalesce into one pending native contraction; don't
       // let a quick double-click consume the voice-control action budget.
+      if ((value === 'expand' || value === 'collapse') && !plugin(event, 'overlay')) throw new Error('面板不能调整浮窗。');
       if (!(value === 'expand' || value === 'collapse' ? r.resizeLimit() : r.limit())) throw new Error('操作过于频繁。');
       try {
         if (!actionPolicy(value, r.manifest.capabilities, this.state)) return;
@@ -235,7 +370,7 @@ class PluginHost {
       } catch (e) { if (e instanceof PluginViolation) void this.violation(e, r.manifest.id); throw e; }
     });
     this.ipcMain.handle('relink:plugin:display-state', (event, value, transition) => {
-      const r = plugin(event);
+      const r = plugin(event, 'overlay');
       if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
       if (!['compact','expanded','notch'].includes(value) || (value === 'notch' && !this.gameMode)) throw new Error('显示状态无效。');
       if (transition !== undefined && (!Number.isSafeInteger(transition) || transition < 1)) throw new Error('动画标识无效。');
@@ -245,7 +380,7 @@ class PluginHost {
       void this.resize(r, value === 'expanded', transition);
     });
     this.ipcMain.handle('relink:plugin:display-settled', (event, transition) => {
-      const r = plugin(event);
+      const r = plugin(event, 'overlay');
       if (!r || this.incident || this.disposed || !this.state.authenticated || !r.manifest.capabilities.includes('window.resize')) throw new Error('来源不允许。');
       if (!Number.isSafeInteger(transition) || transition < 1) throw new Error('动画标识无效。');
       if (r.transition !== transition) return;
@@ -403,6 +538,8 @@ class PluginHost {
     }
   }
   async check(r) {
+    // Unsigned folder plugins exist only while developer mode is on; they are never a security incident.
+    if (r.dev) { if (!this.developer.enabled) throw new Error('插件开发者模式已关闭。'); return; }
     let handle;
     try {
       verifyAuthorization(r, this.authority);
@@ -436,43 +573,33 @@ class PluginHost {
     } finally { await handle?.close(); }
   }
   async sync(r) {
-    const show = !r.removed && !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);
-    if (!show) { this.close(r); return; }
+    // API v4 background pages run whenever the plugin is enabled and signed in; overlay and panel keep the display-mode rule.
+    const run = !r.removed && !this.disposed && !this.incident && this.pref(r.manifest.id).enabled && this.state.authenticated;
+    const show = run && (this.pref(r.manifest.id).displayMode !== 'voice' || this.state.inVoice);
+    if (!run) { this.close(r); this.closePanel(r); this.closeBackground(r); this.network.abort(r.manifest.id); return; }
+    if (!show) { this.close(r); this.closePanel(r); }
     if (r.error) return;
+    if (r.manifest.background) await this.openBackground(r);
+    if (!show) return;
+    // API v3 plugins can live only in their panel; the panel opens when the client shows it.
+    if (!r.manifest.entry) return;
     if (r.window || r.opening || r.recovering) return;
-    if ([...this.records.values()].filter(item => item.window || item.opening).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
+    if ([...this.records.values()].filter(item => item !== r && (this.surfaces(item).length || item.opening)).length >= 3) { r.error = '最多同时运行 3 个插件。'; this.notify(); return; }
     r.opening = true;
     let createdWindow = null;
     try {
       await this.check(r);
       if (r.removed) return;
-      if (![1,2].includes(r.manifest.apiVersion)) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
-      // Dedicated in-memory partition. No account session, storage or default preload is shared.
-      const ses = r.session || this.session.fromPartition(`relink-plugin-${r.manifest.id}`, { cache: false });
-      if (!r.session) {
-        await ses.protocol.handle('relink-plugin', request => {
-        const name = allowedAsset(request.url, r.manifest.id, r.assets);
-        if (!name || request.method !== 'GET') return new Response('', { status: 403 });
-        return new Response(r.assets.get(name), { headers: { 'Content-Type': MIME[name.split('.').pop()], 'Content-Security-Policy': CSP, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
-        });
-        if (r.removed) { ses.protocol.unhandle('relink-plugin'); return; }
-        ses.setPermissionCheckHandler(() => false); ses.setPermissionRequestHandler((_wc, _p, callback) => callback(false));
-        ses.setDevicePermissionHandler(() => false);
-        ses.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !allowedAsset(details.url, r.manifest.id, r.assets) }));
-        ses.on('will-download', event => event.preventDefault());
-        r.session = ses;
-      }
-      const w = new this.BrowserWindow({ width: 320, height: 74, minWidth: 0, minHeight: 0, thickFrame: false, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false, maximizable: false, minimizable: false, fullscreenable: false, skipTaskbar: true, alwaysOnTop: true, show: false, hasShadow: false, title: r.manifest.name, webPreferences: { preload: path.join(__dirname, 'plugin-preload.cjs'), session: ses, nodeIntegration: false, nodeIntegrationInWorker: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, spellcheck: false, devTools: false, backgroundThrottling: true } });
+      if (!API_VERSIONS.includes(r.manifest.apiVersion)) { r.error = '此插件需要更新版本的 Relink。'; this.notify(); return; }
+      const ses = await this.ensureSession(r);
+      if (!ses) return;
+      const w = new this.BrowserWindow({ width: 320, height: 74, minWidth: 0, minHeight: 0, thickFrame: false, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false, maximizable: false, minimizable: false, fullscreenable: false, skipTaskbar: true, alwaysOnTop: true, show: false, hasShadow: false, title: (r.dev ? '[开发中] ' : '') + r.manifest.name, webPreferences: this.sandboxPreferences(ses, r) });
       r.window = w; r.expanded = false; r.gameAware = false; r.displayState = null; r.focusable = true; r.ignoringMouse = undefined; r.limit = limiter(); r.resizeLimit = limiter(24); r.settingsLimit = limiter(30); r.overBudget = 0;
       w.on('blur', () => { if (!this.gameMode && r.displayState === 'expanded') w.webContents.send('relink:plugin:dismiss'); });
       w.setAlwaysOnTop(true, 'screen-saver');
       w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
       createdWindow = w;
-      const wc = w.webContents;
-      wc.setWindowOpenHandler(() => ({ action: 'deny' }));
-      wc.on('will-navigate', event => event.preventDefault());
-      wc.on('will-frame-navigate', event => event.preventDefault());
-      wc.on('will-attach-webview', event => event.preventDefault());
+      this.lockNavigation(w.webContents); this.developer.attach(r, w.webContents, 'overlay');
       this.watchWindow(r, w);
       w.once('closed', () => { if (r.window === w) r.window = null; });
       this.position(r);
@@ -506,12 +633,13 @@ class PluginHost {
   close(r) { if (!r) return; this.cancelRecovery(r); clearTimeout(r.unresponsiveTimer); r.unresponsiveTimer = null; this.cancelResize(r); if (!r.window) return; const w = r.window; r.window = null; if (!w.isDestroyed()) w.destroy(); if (![...this.records.values()].some(item => item.window)) this.pointer.stop(); }
   release(r) {
     if (!r) return;
-    this.close(r);
+    this.close(r); this.closePanel(r); this.closeBackground(r); this.network.abort(r.manifest.id);
     if (r.session) { const session = r.session; r.session = null; session.protocol.unhandle('relink-plugin'); return session.clearStorageData().catch(() => {}); }
   }
   handleError(r, error, cause = 'runtime') {
     if (error instanceof PluginViolation) { void this.violation(error, r.manifest.id); return; }
     if (r.removed || this.disposed || this.incident) return;
+    if (r.dev) this.developer.log('host', 'error', `${{ memory: '超过内存限额', crash: '进程崩溃', unresponsive: '持续未响应' }[cause] || '运行出错'}：${error?.message || error}`);
     // A single bounded record explains a later failure without recording
     // account/session data, music metadata or arbitrary exception strings.
     const metric = r.window && this.app.getAppMetrics?.().find(m => m.pid === r.window.webContents.getOSProcessId());
@@ -523,7 +651,7 @@ class PluginHost {
     r.runtimeFailures = (r.runtimeFailures || []).filter(at => now - at < 300000);
     const recover = cause !== 'memory' && r.runtimeFailures.length < 2 && this.state.authenticated && this.pref(r.manifest.id).enabled;
     r.runtimeFailures.push(now);
-    this.close(r);
+    this.close(r); this.closePanel(r); this.closeBackground(r); this.network.abort(r.manifest.id);
     r.error = cause === 'memory' ? '插件持续超过内存限额，已暂停。' : '插件连续运行异常，已暂停。请关闭后重新启用。';
     if (recover) {
       r.error = null; r.recovering = true;
@@ -545,11 +673,16 @@ class PluginHost {
       await this.serialize(async () => {
       for (const r of this.records.values()) {
         await this.check(r);
-        if (r.window) {
-          const metric = this.app.getAppMetrics().find(m => m.pid === r.window.webContents.getOSProcessId());
+        const surfaces = this.surfaces(r);
+        if (surfaces.length) {
           // Windows working sets include Chromium's shared pages. Apply the
           // same 192 MiB cap to the renderer's private allocation instead.
-          const bytes = Number.isFinite(metric?.memory?.privateBytes) ? metric.memory.privateBytes : metric?.memory?.workingSetSize;
+          // Overlay and panel each count; the larger one decides.
+          const metrics = this.app.getAppMetrics();
+          const bytes = Math.max(0, ...surfaces.map(surface => {
+            const metric = metrics.find(m => m.pid === surface.wc.getOSProcessId());
+            return Number.isFinite(metric?.memory?.privateBytes) ? metric.memory.privateBytes : metric?.memory?.workingSetSize ?? 0;
+          }));
           r.overBudget = bytes > 196608 ? (r.overBudget || 0) + 1 : 0;
           if (r.overBudget >= 2) this.handleError(r, new Error('插件超过内存预算。'), 'memory');
         }
@@ -576,7 +709,7 @@ class PluginHost {
     const w = this.getWindow(); if (w && !w.isDestroyed()) w.webContents.send('relink:plugins:shutdown', this.incident);
   }
   dispose() {
-    this.updates.stop(); this.services.stop(); this.pointer.stop(); this.disposed = true; clearInterval(this.auditTimer); clearInterval(this.gameTimer);
+    this.updates.stop(); this.services.stop(); this.v3.stop(); this.developer.stop(); this.network.stop(); this.chat.stop(); this.pointer.stop(); this.disposed = true; clearInterval(this.auditTimer); clearInterval(this.gameTimer);
     this.mainWindow?.removeListener?.('move', this.displayChanged);
     this.screen.removeListener('display-added', this.displayChanged);
     this.screen.removeListener('display-removed', this.displayChanged); this.screen.removeListener('display-metrics-changed', this.displayChanged);

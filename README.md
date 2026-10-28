@@ -1,10 +1,19 @@
 # Relink Plugins
 
-Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1、v2 / SDK 0.3.2**。代码开源许可与 Relink 客户端的发布授权分别管理。
+Relink 插件开发开源项目：SDK、打包工具、隔离宿主、授权校验与开发样例。本文档对应 **插件 API v1、v2、v3 / SDK 0.4.0**。代码开源许可与 Relink 客户端的发布授权分别管理。
 
 [官网开发文档与提交入口](https://relinkus.cn/plugins/) · [审核与发布指南](docs/publishing.md)
 
 桌面插件需要支持相应插件 API 的客户端。超过 2 MiB 的插件需要 Relink 1.1.0 补丁 5 或更新版本。开发时使用独立预览环境，安装前核对插件与宿主版本的兼容性。
+
+## 从这里开始
+
+```sh
+node tools/create.cjs ../my-plugin        # 从模板创建：面板、聊天命令或 AI 助手
+node tools/preview.cjs ../my-plugin       # 浏览器预览，带模拟频道，联网是真实请求
+```
+
+然后在 Relink「设置 → 插件 → 插件开发者模式」加载这个文件夹，保存即自动重新加载，可以打开插件的开发者工具、查看插件日志。完整流程和常见问题见 [开发与调试指南](docs/debugging.md)。
 
 ## 最小示例
 
@@ -22,7 +31,7 @@ node tools/pack.cjs examples/hello-relink hello-relink.unsigned.rlplugin
 
 `manifest.json` 声明插件 ID、名称、版本、API 版本、入口和权限。示例只使用 HTML / CSS / JS。资源限定为同一目录的普通文件，最多 32 个，解码后的总资源最多 75 MiB，整个签名安装包最多 100 MiB（界面标为 100 MB），打包器为授权信息预留 1 KiB。不支持本地 Node 模块、原生 DLL、网络地址和任意目录访问。
 
-**未授权包用于审核，不要导入正式客户端。** 导入未授权插件会触发 Relink 的安全退出策略。`preview.cjs` 在本机启动使用模拟数据的独立浏览器预览，不连接 Relink，不要求授权，也不使用账户信息；正式客户端没有关闭校验的开发开关。预览只验证界面；生产沙箱与真实通话需要独立 Electron 宿主测试。
+**未授权包用于审核，不要导入正式客户端。** 导入未授权插件会触发 Relink 的安全退出策略。`preview.cjs` 在本机启动使用模拟数据的独立浏览器预览，不连接 Relink，不要求授权，也不使用账户信息：通话、成员、频道聊天、命令、通知、存储和设置都是模拟的，只有 `relinkPlugin.fetch` 由预览服务器按和客户端相同的规则真实代发（密钥从 `RELINK_SECRET_<ID>` 环境变量读取）。正式客户端不会关闭签名校验；要在真实客户端里调试未签名的插件，使用插件开发者模式，它只在本次运行有效，插件始终带「开发中」标记。
 
 ## 授权发布
 
@@ -34,6 +43,23 @@ node tools/pack.cjs examples/hello-relink hello-relink.unsigned.rlplugin
 授权签名为 Ed25519，绑定插件 ID、版本、完整清单及逐文件 SHA-256 摘要。客户端只包含公钥。自行生成密钥并签署不能获得 Relink 正式客户端的授权。授权私钥及正式客户端的其他源代码不包含在此项目中。上传进入待审核队列，由 Relink 控制台核验并授权；提交不等于审核通过。
 
 开源代码采用 MIT，可学习、修改和制作独立宿主；不得将修改版标识为 Relink 官方授权版本。MIT 不授予 Relink 商标使用权，也不意味着可跳过正式客户端的发布授权。
+
+## API v4（新增）
+
+v4 让插件可以联网（只能访问声明的网站，由 Relink 代发）、使用用户填写的 API Key（插件读不到明文）、读写频道聊天（读取需 Room 域主允许，发出的消息带插件标签）、边生成边显示回答（修改自己发的消息）、发 Markdown 消息、订阅消息和语音进出事件、读取更早的消息和其他频道（`chat.history`）、注册 `/命令`、发送通知和保存本机数据，支持文字、多行文字和下拉设置项，以及没有窗口的后台页面。完整说明见 [docs/api-v4.md](docs/api-v4.md)，示例见 `examples/deepseek-assistant/`（在频道里输入 `/ai 问题` 调用 DeepSeek）。
+
+```sh
+node tools/validate.cjs examples/deepseek-assistant
+```
+
+## API v3
+
+v3 增加了说话者与成员状态（`voice.participants`）、通话控制里的插件按钮（`commands`）、语音页里的内嵌面板（`panel`）和宿主信息（`getHostInfo()`），还新增了供作者调试用的插件开发者模式。完整说明见 [docs/api-v3.md](docs/api-v3.md)，示例见 `examples/speakers/`。
+
+```sh
+node tools/validate.cjs examples/speakers   # 打包前检查清单，并列出安装时会向用户说明的权限
+node tools/preview.cjs examples/speakers    # 浏览器预览，/panel 是面板，会模拟成员说话和按钮点击
+```
 
 ## v1 API
 
@@ -94,7 +120,12 @@ stop();
 - `runtime/package.cjs`：格式、摘要、签名与撤销校验。
 - `host/`：开源 Electron 插件宿主、权限策略和独立 preload。
 - `examples/hello-relink/`：状态订阅与返回主窗口的最小开发示例。
+- `examples/deepseek-assistant/`：API v4 示例，`/ai` 命令调用 DeepSeek 并把回答发进频道。
+- `tools/create.cjs`：从模板创建新插件。
+- `tools/preview.cjs`：浏览器预览（模拟数据，带模拟频道）。
+- `tools/validate.cjs`：检查清单，用中文说明问题，并列出安装时会向用户说明的权限。
 - `tools/pack.cjs`：生成待审核包。
+- `docs/debugging.md`：开发与调试指南。
 - `tests/`：授权边界测试。
 
 请参阅 [SECURITY.md](SECURITY.md) 与 [LICENSE](LICENSE)。

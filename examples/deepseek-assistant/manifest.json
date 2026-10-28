@@ -1,0 +1,21 @@
+{
+  "id": "deepseek-assistant",
+  "name": "DeepSeek 助手",
+  "version": "0.2.0",
+  "apiVersion": 4,
+  "description": "API v4 示例：在频道里输入 /ai 提问，或 /ai-summary 总结最近的聊天，回答边生成边显示，以“来自 DeepSeek 助手”发进频道。",
+  "background": "background.html",
+  "capabilities": ["net.fetch", "secrets", "chat.read", "chat.send", "chat.commands", "notify", "storage"],
+  "network": ["api.deepseek.com"],
+  "secrets": [{ "id": "deepseek", "label": "DeepSeek API Key" }],
+  "chatCommands": [
+    { "name": "ai", "description": "向 DeepSeek 提问，回答发到频道" },
+    { "name": "ai-summary", "description": "总结频道最近的聊天" }
+  ],
+  "settings": [
+    { "key": "model", "label": "模型", "type": "select", "default": "deepseek-chat",
+      "options": [{ "value": "deepseek-chat", "label": "对话（快）" }, { "value": "deepseek-reasoner", "label": "推理（慢，适合复杂问题）" }] },
+    { "key": "useContext", "label": "提问时附带最近 20 条频道消息", "type": "toggle", "default": true },
+    { "key": "prompt", "label": "自定义提示词（可选）", "type": "textarea", "default": "", "maxLength": 1000, "placeholder": "例如：回答时称呼大家为队友" }
+  ]
+}
